@@ -1,0 +1,404 @@
+{
+  "fetchedAt": "2026-10-31T22:59:58.472Z",
+  "sources": {
+    "transportCanada": {
+      "name": "Transport Canada - EV Dashboard",
+      "lastRefreshed": "2026-10-31T22:59:58.472Z",
+      "ok": true,
+      "error": null
+    },
+    "afdc": {
+      "name": "US DOE AFDC - Public EV charging (Canada)",
+      "lastRefreshed": "2026-10-31T22:59:58.472Z",
+      "ok": true,
+      "error": null
+    }
+  },
+  "kpis": {
+    "totalEvs": 1077814,
+    "bevs": 758853,
+    "phevs": 318604,
+    "totalChargers": 39220,
+    "evPerCharger": 27,
+    "marketSharePct": 11.7,
+    "marketShareQuarter": "2026 ( YTD )",
+    "afdcLocations": 14291,
+    "afdcLevel2": 30350,
+    "afdcDcFast": 9403,
+    "afdcKw": 75958
+  },
+  "data": {
+    "transportCanada": {
+      "updated": "August 2026",
+      "kpis": {
+        "totalEvs": 1077814,
+        "bevs": 758853,
+        "phevs": 318604,
+        "totalChargers": 39220,
+        "level2": 30741,
+        "level3": 8479,
+        "evPerCharger": 27,
+        "fcevs": 357
+      },
+      "marketShare": [
+        {
+          "period": "2019",
+          "bev": 2,
+          "phev": 1.1,
+          "fcev": 0,
+          "total": 3.1
+        },
+        {
+          "period": "2020",
+          "bev": 2.7,
+          "phev": 1.1,
+          "fcev": 0,
+          "total": 3.8
+        },
+        {
+          "period": "2021",
+          "bev": 3.8,
+          "phev": 1.8,
+          "fcev": 0,
+          "total": 5.6
+        },
+        {
+          "period": "2022",
+          "bev": 7,
+          "phev": 1.9,
+          "fcev": 0,
+          "total": 8.9
+        },
+        {
+          "period": "2023",
+          "bev": 8.8,
+          "phev": 2.8,
+          "fcev": 0,
+          "total": 11.6
+        },
+        {
+          "period": "2024",
+          "bev": 11.4,
+          "phev": 3.9,
+          "fcev": 0,
+          "total": 15.4
+        },
+        {
+          "period": "2025",
+          "bev": 6.7,
+          "phev": 3.6,
+          "fcev": 0,
+          "total": 10.3
+        },
+        {
+          "period": "2026 ( YTD )",
+          "bev": 8,
+          "phev": 3.6,
+          "fcev": 0,
+          "total": 11.7
+        }
+      ],
+      "fleet": [
+        {
+          "category": "Light-duty BEVs",
+          "count": 758853,
+          "sharePct": 2.8
+        },
+        {
+          "category": "Light-duty PHEVs",
+          "count": 318604,
+          "sharePct": 1.2
+        },
+        {
+          "category": "Light-duty FCEVs",
+          "count": 346,
+          "sharePct": 0
+        },
+        {
+          "category": "All light-duty vehicles",
+          "count": 26968378,
+          "sharePct": 100
+        },
+        {
+          "category": "Medium and heavy-duty BEVs",
+          "count": 11464,
+          "sharePct": 0.4
+        },
+        {
+          "category": "Medium and heavy-duty FCEVs",
+          "count": 11,
+          "sharePct": 0
+        },
+        {
+          "category": "All medium- and heavy-duty vehicles",
+          "count": 2652370,
+          "sharePct": 100
+        }
+      ],
+      "provinces": [
+        {
+          "province": "Newfoundland and Labrador",
+          "evPerCharger": 16,
+          "totalChargers": 225,
+          "totalEvs": 3646
+        },
+        {
+          "province": "Prince Edward Island",
+          "evPerCharger": 10,
+          "totalChargers": 341,
+          "totalEvs": 3260
+        },
+        {
+          "province": "Nova Scotia",
+          "evPerCharger": 19,
+          "totalChargers": 653,
+          "totalEvs": 12135
+        },
+        {
+          "province": "New Brunswick",
+          "evPerCharger": 18,
+          "totalChargers": 541,
+          "totalEvs": 9488
+        },
+        {
+          "province": "Quebec",
+          "evPerCharger": 36,
+          "totalChargers": 13081,
+          "totalEvs": 473385
+        },
+        {
+          "province": "Ontario",
+          "evPerCharger": 21,
+          "totalChargers": 13392,
+          "totalEvs": 277219
+        },
+        {
+          "province": "Manitoba",
+          "evPerCharger": 21,
+          "totalChargers": 554,
+          "totalEvs": 11383
+        },
+        {
+          "province": "Saskatchewan",
+          "evPerCharger": 15,
+          "totalChargers": 411,
+          "totalEvs": 6114
+        },
+        {
+          "province": "Alberta",
+          "evPerCharger": 20,
+          "totalChargers": 2124,
+          "totalEvs": 42041
+        },
+        {
+          "province": "British Columbia",
+          "evPerCharger": 30,
+          "totalChargers": 7820,
+          "totalEvs": 238077
+        },
+        {
+          "province": "Yukon",
+          "evPerCharger": 10,
+          "totalChargers": 55,
+          "totalEvs": 567
+        },
+        {
+          "province": "Northwest Territories",
+          "evPerCharger": 6,
+          "totalChargers": 23,
+          "totalEvs": 129
+        },
+        {
+          "province": "Nunavut",
+          "evPerCharger": null,
+          "totalChargers": 0,
+          "totalEvs": 13
+        }
+      ],
+      "chargerGrowth": [
+        {
+          "period": "2017",
+          "level2": 2054,
+          "level3": 455
+        },
+        {
+          "period": "2018",
+          "level2": 6359,
+          "level3": 835
+        },
+        {
+          "period": "2019",
+          "level2": 9502,
+          "level3": 1579
+        },
+        {
+          "period": "2020",
+          "level2": 9972,
+          "level3": 2202
+        },
+        {
+          "period": "2021",
+          "level2": 12169,
+          "level3": 3048
+        },
+        {
+          "period": "2022",
+          "level2": 15412,
+          "level3": 3656
+        },
+        {
+          "period": "2023",
+          "level2": 21095,
+          "level3": 4718
+        },
+        {
+          "period": "2024",
+          "level2": 26205,
+          "level3": 6093
+        },
+        {
+          "period": "2025",
+          "level2": 30289,
+          "level3": 8075
+        },
+        {
+          "period": "March 2026",
+          "level2": 30741,
+          "level3": 8479
+        }
+      ],
+      "url": "https://tc.canada.ca/en/road-transportation/innovative-technologies/electric-vehicles/canada-electric-vehicle-dashboard"
+    },
+    "afdc": {
+      "source": "US DOE Alternative Fuels Data Center (covers Canada)",
+      "flavor": "units",
+      "stationCount": 14291,
+      "rawRowCount": 39767,
+      "headerLine": "Fuel Type Code,Station Name,Street Address,Intersection Directions,City,State,ZIP,Plus4,Station Phone,Status Code,Expected Date,Groups With Access Code,Access Days Time,Cards Accepted,BD Blends,NG Fill Type Code,NG PSI,EV Level1 EVSE Num,EV Level2 EVSE Num,EV DC Fast Count,EV Other Info,EV Network,EV Network Web,Geocode Status,Latitude,Longitude,Date Last Confirmed,ID,Updated At,Owner Type Code,Fe",
+      "totalLocations": 14291,
+      "level1Units": 14,
+      "level2Units": 30350,
+      "dcFastUnits": 9403,
+      "totalKw": 75958,
+      "byProvince": [
+        {
+          "province": "Quebec",
+          "level2": 10901,
+          "dcFast": 3071,
+          "kw": 26163
+        },
+        {
+          "province": "Ontario",
+          "level2": 10371,
+          "dcFast": 2467,
+          "kw": 25604
+        },
+        {
+          "province": "British Columbia",
+          "level2": 5015,
+          "dcFast": 2555,
+          "kw": 12442
+        },
+        {
+          "province": "Alberta",
+          "level2": 1775,
+          "dcFast": 484,
+          "kw": 4090
+        },
+        {
+          "province": "Nova Scotia",
+          "level2": 531,
+          "dcFast": 166,
+          "kw": 1552
+        },
+        {
+          "province": "Manitoba",
+          "level2": 465,
+          "dcFast": 135,
+          "kw": 1992
+        },
+        {
+          "province": "New Brunswick",
+          "level2": 402,
+          "dcFast": 196,
+          "kw": 1419
+        },
+        {
+          "province": "Prince Edward Island",
+          "level2": 387,
+          "dcFast": 27,
+          "kw": 1007
+        },
+        {
+          "province": "Saskatchewan",
+          "level2": 213,
+          "dcFast": 194,
+          "kw": 833
+        },
+        {
+          "province": "Newfoundland and Labrador",
+          "level2": 223,
+          "dcFast": 75,
+          "kw": 679
+        },
+        {
+          "province": "Yukon",
+          "level2": 49,
+          "dcFast": 22,
+          "kw": 75
+        },
+        {
+          "province": "Northwest Territories",
+          "level2": 18,
+          "dcFast": 11,
+          "kw": 100
+        }
+      ],
+      "topNetworks": [
+        {
+          "network": "ChargePoint Network",
+          "count": 3812
+        },
+        {
+          "network": "FLO",
+          "count": 3521
+        },
+        {
+          "network": "Circuit électrique",
+          "count": 3128
+        },
+        {
+          "network": "Non-Networked",
+          "count": 1425
+        },
+        {
+          "network": "SWTCH",
+          "count": 472
+        },
+        {
+          "network": "Tesla Destination",
+          "count": 409
+        },
+        {
+          "network": "Tesla",
+          "count": 294
+        },
+        {
+          "network": "CHARGELAB",
+          "count": 231
+        },
+        {
+          "network": "BCHYDRO",
+          "count": 193
+        },
+        {
+          "network": "eCharge Network",
+          "count": 110
+        }
+      ],
+      "url": "https://afdc.energy.gov/stations/states",
+      "downloadedVia": "fetch",
+      "lastUpdated": "2026-10-31T06:26:35Z"
+    }
+  }
+}
