@@ -1,14 +1,23 @@
 // ============================================================================
-// FILE: scripts/fetch-data.js   (v5 - Nov 2026)
+// FILE: scripts/fetch-data.js   (v6 - Nov 2026)
 // ----------------------------------------------------------------------------
 // Changes in this version:
-//   1. Open Canada XLSX: headers have changed to "Organization | Initiative | ..."
-//      - Try all worksheets, not just the first one
-//      - Broaden column search: look for any geography/province/territory/jurisdiction
-//        and any count/port/charger/connector column
-//      - Print full header on failure so we can diagnose
-//   2. StatCan WDS API with CSV fallback (as in v4)
-//   3. Transport Canada unchanged
+//   1. Transport Canada KPIs now have a TABLE-BASED FALLBACK:
+//      - primary: parse the headline prose (robust multi-pattern regexes)
+//      - fallback: compute Total EVs from the fleet table (sum of BEV/PHEV/
+//        FCEV rows) and Level 2/Level 3/total chargers from the cumulative
+//        charger tables (last row = most recent, currently March 2026)
+//      - ratio computed as totalEvs / totalChargers if the prose doesn't give it
+//      Reason: the KPI strip on the page may be assembled by JavaScript, so a
+//      plain HTTP fetch can miss it - but the tables are plain HTML.
+//   2. NEW DATA: per-province table from Transport Canada (EVs per public
+//      charger, total public chargers, total EV count per province/territory)
+//      -> snapshot.data.transportCanada.provinces
+//   3. NEW DATA: cumulative charger growth by year
+//      -> snapshot.data.transportCanada.chargerTrend
+//   4. Bug fix: fundedProjects KPI referenced a non-existent field.
+//   5. StatCan WDS API + CSV fallback and the flexible Open Canada XLSX
+//      parser from v5 are unchanged.
 // ============================================================================
 
 "use strict";
@@ -75,7 +84,12 @@ function pct(v) {
 }
 
 function decodeEntities(s) {
-  return s.replace(/&nbsp;/gi, " ").replace(/&#160;/g, " ").trim();
+  return s
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&#160;/g, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/\u00a0/g, " ")
+    .trim();
 }
 
 function cellText(html) {
@@ -144,51 +158,187 @@ function* iterateLines(buffer) {
 
 // ------------------------------------------------------ source 1: Transport Canada
 
+function grabNum(text, patterns) {
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m) {
+      const v = num(m[1]);
+      if (v != null) return v;
+    }
+  }
+  return null;
+}
+
 async function fetchTransportCanada() {
   const html = await getText(TC_URL);
   const updatedMatch = html.match(/[Dd]ata was updated in ([A-Z][a-z]+ \d{4})/);
   const updated = updatedMatch ? updatedMatch[1] : null;
   const text = cellText(html);
-  const grab = (re) => { const m = text.match(re); return m ? num(m[1]) : null; };
-  const ratio = text.match(/ratio[^\d]{0,40}(\d+)\D{1,15}(\d+)/);
-
-  const kpis = {
-    totalEvs: grab(/Total EVs:?\s*([\d,]+)/),
-    bevs: grab(/BEVs:?\s*([\d,]+)/),
-    phevs: grab(/PHEVs:?\s*([\d,]+)/),
-    totalChargers: grab(/Total chargers:?\s*([\d,]+)/),
-    level2: grab(/Level 2:?\s*([\d,]+)/),
-    level3: grab(/Level 3:?\s*([\d,]+)/),
-    evPerCharger: ratio ? Math.round(parseInt(ratio[1], 10) / parseInt(ratio[2], 10)) : null,
-  };
-
   const tables = parseTables(html);
   const header = (t) => t[0].map((c) => c.toLowerCase());
 
-  let marketShare = null;
+  // ---- Tables ---------------------------------------------------------
+
+  // Fleet: "Vehicle category and type | Number of vehicles | Market share"
+  let fleet = null;
   for (const t of tables) {
     const h = header(t);
-    if (h.includes("year") && h.includes("bev")) {
-      marketShare = t.slice(1).map((r) => ({
-        period: r[0], bev: pct(r[1]), phev: pct(r[2]), fcev: pct(r[3]), total: pct(r[4]),
-      })).filter((x) => x.total != null);
+    if (h.some((c) => c.includes("vehicle category")) &&
+        h.some((c) => c.includes("number of vehicles"))) {
+      fleet = t.slice(1).map((r) => ({
+        category: r[0], count: num(r[1]), sharePct: pct(r[2]),
+      }));
+      break;
+    }
+  }
+  // older header variant
+  if (!fleet) {
+    for (const t of tables) {
+      const h = header(t);
+      if (h.some((c) => c.includes("vehicle category")) &&
+          h.some((c) => c.includes("market share"))) {
+        fleet = t.slice(1).map((r) => ({
+          category: r[0], count: num(r[1]), sharePct: pct(r[2]),
+        }));
+        break;
+      }
+    }
+  }
+
+  // Cumulative chargers by year: "Year | Level 2 | Level 3"
+  let chargerTrend = null;
+  for (const t of tables) {
+    const h = header(t);
+    if (h[0] === "year" && h.includes("level 2") && h.includes("level 3")) {
+      chargerTrend = t.slice(1).map((r) => ({
+        period: r[0], level2: num(r[1]), level3: num(r[2]),
+        total: num(r[1]) != null && num(r[2]) != null ? num(r[1]) + num(r[2]) : null,
+      }));
       break;
     }
   }
 
-  let fleet = null;
+  // Total chargers by year: "Year | Total chargers"
+  let totalChargerTrend = null;
   for (const t of tables) {
     const h = header(t);
-    if (h.some((c) => c.includes("vehicle category")) && h.some((c) => c.includes("market share"))) {
-      fleet = t.slice(1).map((r) => ({ category: r[0], count: num(r[1]), sharePct: pct(r[2]) }));
+    if (h[0] === "year" && h.includes("total chargers") && !h.includes("level 2")) {
+      totalChargerTrend = t.slice(1).map((r) => ({
+        period: r[0], totalChargers: num(r[1]),
+      }));
       break;
     }
   }
+
+  // Annual market share: "Year | BEV% | PHEV% | FCEV% | Total%" style
+  let marketShare = null;
+  for (const t of tables) {
+    const h = header(t);
+    if (h.includes("year") && h.some((c) => c.includes("bev")) &&
+        !h.includes("level 2")) {
+      marketShare = t.slice(1).map((r) => ({
+        period: r[0], bev: pct(r[1]), phev: pct(r[2]), fcev: pct(r[3]), total: pct(r[4]),
+      })).filter((x) => x.total != null);
+      if (marketShare.length) break;
+      marketShare = null;
+    }
+  }
+
+  // Province table: "Province/territory | [stats cell]"
+  // stats cell reads like: "EVs per public charger: 36  Total public
+  // chargers: 13,081  Total EV count: 473,385"
+  let provinces = null;
+  for (const t of tables) {
+    const h = header(t);
+    if (h.some((c) => c.includes("province")) &&
+        t.slice(1).some((r) => /EVs per public charger/i.test(r[1] || ""))) {
+      provinces = t.slice(1).map((r) => {
+        const stats = String(r[1] || "");
+        const g = (re) => {
+          const m = stats.match(re);
+          return m ? num(m[1]) : null;
+        };
+        return {
+          province: String(r[0] || "").trim(),
+          evsPerCharger: g(/EVs per public charger:?\s*([\d,.]+)/i),
+          publicChargers: g(/Total public chargers?:?\s*([\d,.]+)/i),
+          evCount: g(/Total EV count:?\s*([\d,.]+)/i),
+        };
+      }).filter((p) => p.province);
+      break;
+    }
+  }
+
+  // ---- KPIs: prose first, table fallback second -----------------------
+
+  let kpis = {
+    totalEvs: grabNum(text, [/Total EVs?:?\s*([\d,]+)/i, /Total (?:electric vehicles|EVs)[^\d]{0,40}([\d,]{6,})/i]),
+    bevs: grabNum(text, [/BEVs?:?\s*([\d,]+)/i]),
+    phevs: grabNum(text, [/PHEVs?:?\s*([\d,]+)/i]),
+    totalChargers: grabNum(text, [/Total chargers?:?\s*([\d,]+)/i]),
+    level2: grabNum(text, [/Level 2:?\s*([\d,]+)/i]),
+    level3: grabNum(text, [/Level 3:?\s*([\d,]+)/i]),
+    evPerCharger: null,
+  };
+
+  // ratio from prose: "ratio: 27 EVs: 1 charger"
+  const ratioM = text.match(/ratio[^0-9]{0,40}?(\d+)\s*EVs?\s*[:,]?\s*(\d+)\s*charger/i);
+  if (ratioM) {
+    kpis.evPerCharger = num(ratioM[1]) != null ? num(ratioM[1]) :
+      (num(ratioM[2]) ? Math.round(num(ratioM[1]) / num(ratioM[2])) : null);
+  }
+
+  // Fallbacks from tables (KPI strip may be JS-rendered; tables are not)
+  if (kpis.level2 == null && chargerTrend && chargerTrend.length) {
+    const last = chargerTrend[chargerTrend.length - 1];
+    kpis.level2 = last.level2;
+    kpis.level3 = last.level3;
+  }
+  if (kpis.totalChargers == null) {
+    if (totalChargerTrend && totalChargerTrend.length) {
+      kpis.totalChargers = totalChargerTrend[totalChargerTrend.length - 1].totalChargers;
+    } else if (kpis.level2 != null && kpis.level3 != null) {
+      kpis.totalChargers = kpis.level2 + kpis.level3;
+    }
+  }
+  if (kpis.bevs == null && fleet) {
+    kpis.bevs = fleet.filter((r) => /^light-duty BEVs?$/i.test(r.category))
+      .reduce((s, r) => s + (r.count || 0), 0) || null;
+  }
+  if (kpis.phevs == null && fleet) {
+    kpis.phevs = fleet.filter((r) => /^light-duty PHEVs?$/i.test(r.category))
+      .reduce((s, r) => s + (r.count || 0), 0) || null;
+  }
+  if (kpis.totalEvs == null && fleet) {
+    // sum every EV row (exclude the "All vehicles" denominator rows)
+    const evRows = fleet.filter((r) =>
+      /(^light-duty (BEV|PHEV|FCEV))|(^medium and heavy-duty (BEV|FCEV))/i.test(r.category)
+    );
+    if (evRows.length) {
+      kpis.totalEvs = evRows.reduce((s, r) => s + (r.count || 0), 0);
+    }
+  }
+  if (kpis.evPerCharger == null && kpis.totalEvs && kpis.totalChargers) {
+    kpis.evPerCharger = Math.round(kpis.totalEvs / kpis.totalChargers);
+  }
+  // If prose gave everything except one field, patch from per-province sums
+  if (provinces && provinces.length) {
+    if (kpis.totalChargers == null) {
+      kpis.totalChargers = provinces.reduce((s, p) => s + (p.publicChargers || 0), 0);
+    }
+    if (kpis.totalEvs == null) {
+      kpis.totalEvs = provinces.reduce((s, p) => s + (p.evCount || 0), 0);
+    }
+  }
+
+  kpis.source = kpis.totalEvs != null && kpis.totalChargers != null
+    ? "parsed" : "partial";
 
   let imhzev = null;
   for (const t of tables) {
     const h = header(t);
-    if (h.includes("year") && h.includes("qc") && h.includes("total")) {
+    if (h.includes("year") && h.includes("qc") && h.includes("total") &&
+        !h.includes("level 2")) {
       imhzev = t.slice(1).map((r) => ({
         year: r[0], qc: num(r[1]), bc: num(r[2]), on: num(r[3]), rest: num(r[4]), total: num(r[5]),
       }));
@@ -196,7 +346,7 @@ async function fetchTransportCanada() {
     }
   }
 
-  return { updated, kpis, marketShare, fleet, imhzev, url: TC_URL };
+  return { updated, kpis, marketShare, fleet, chargerTrend, provinces, imhzev, url: TC_URL };
 }
 
 // ------------------------------------------------- source 2: StatCan (WDS API)
@@ -308,8 +458,7 @@ async function fetchStatcanWds() {
       JSON.stringify(dataResults).substring(0, 300));
   }
 
-  const fuels = Object.keys(series).flatMap((q) => Object.keys(series[q]));
-  const fuelNames = [...new Set(fuels)];
+  const fuelNames = [...new Set(Object.keys(series).flatMap((q) => Object.keys(series[q])))];
   const bevLabel = fuelNames.find((f) => /battery\s*electric/i.test(f));
   const phevLabel = fuelNames.find((f) => /plug[- ]?in\s*hybrid/i.test(f));
   const totalFuel = fuelNames.find((f) => /^total/i.test(f));
@@ -444,7 +593,7 @@ async function fetchStatcan() {
   }
 }
 
-// -------------------------------------------- source 3: Open Canada charging projects (v5 - flexible)
+// -------------------------------------------- source 3: Open Canada charging projects
 
 async function findXlsxResource() {
   for (const base of CKAN_BASES) {
@@ -472,10 +621,8 @@ async function findXlsxResource() {
 }
 
 function findColumn(head, keywords) {
-  // First try exact substring match
   const idx = head.findIndex((c) => keywords.some((k) => c.toLowerCase().includes(k)));
   if (idx >= 0) return idx;
-  // Fall back to word-boundary match
   for (let i = 0; i < head.length; i++) {
     const col = head[i].toLowerCase();
     if (keywords.some((k) => {
@@ -486,25 +633,20 @@ function findColumn(head, keywords) {
   return -1;
 }
 
-async function fetchChargingProjectsSheet(ws, xlsxUrl) {
+async function fetchChargingProjectsSheet(ws) {
   const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true });
   if (!rows.length) return null;
 
   const head = rows[0].map((c) => String(c).trim());
 
-  // Broader keyword sets for province and charger count
   const provKeywords = ["province", "prov", "territory", "jurisdiction", "region", "location", "area"];
   const cntKeywords = ["charger", "port", "connector", "borne", "number of", "count", "units"];
 
   const iProv = findColumn(head, provKeywords);
   const iCnt = findColumn(head, cntKeywords);
-
   const iStatus = findColumn(head, ["status", "operational", "active"]);
 
-  if (iProv < 0 || iCnt < 0) {
-    // Return null so the caller tries another sheet
-    return null;
-  }
+  if (iProv < 0 || iCnt < 0) return null;
 
   const byProv = {}, byStatus = {};
   let total = 0, projects = 0;
@@ -545,14 +687,12 @@ async function fetchChargingProjects() {
   const buf = await getBuffer(xlsxUrl);
   const wb = XLSX.read(buf, { type: "buffer" });
 
-  // Try each worksheet until we find one with usable data
   let result = null;
-  let lastError = null;
   let lastHeader = null;
 
   for (const sheetName of wb.SheetNames) {
     const ws = wb.Sheets[sheetName];
-    result = await fetchChargingProjectsSheet(ws, xlsxUrl);
+    result = await fetchChargingProjectsSheet(ws);
     if (result && result.totalFundedChargers) {
       console.log("  Found data in sheet: " + sheetName);
       break;
@@ -563,7 +703,7 @@ async function fetchChargingProjects() {
         lastHeader = rows[0].map((c) => String(c)).slice(0, 15).join(" | ");
       }
     }
-    lastError = "No usable province/charger columns found in sheet " + sheetName;
+    result = null;
   }
 
   if (!result) {
@@ -647,7 +787,7 @@ async function main() {
     marketSharePct: lastReg.zevSharePct != null ? lastReg.zevSharePct : null,
     marketShareQuarter: lastReg.quarter || null,
     fundedChargers: cp.totalFundedChargers != null ? cp.totalFundedChargers : null,
-    fundedProjects: cp.projectCount != null ? cp.totalFundedProjects : null,
+    fundedProjects: cp.projectCount != null ? cp.projectCount : null,
   };
 
   const fname = "snapshot-" + ts.toISOString().replace(/[:.]/g, "-") + ".json";
