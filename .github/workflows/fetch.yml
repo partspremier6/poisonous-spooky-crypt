@@ -5,6 +5,9 @@ on:
     - cron: '0 8 1 * *'   # 1st of every month at 8am UTC
   workflow_dispatch:      # allows manual trigger from Actions tab
 
+permissions:
+  contents: write          # <-- allows the workflow to commit data back
+
 jobs:
   fetch:
     runs-on: ubuntu-24.04
