@@ -1,16 +1,21 @@
 // ============================================================================
-// scripts/fetch-data.js — v10 (streamlined)
+// scripts/fetch-data.js — v11
 //
-// What works (final stable sources):
-//   • Transport Canada (HTML tables) — primary source for ALL EV + charger KPIs
-//   • AFDC /v1.csv (Canada only) — province charging units + networks
-//   • Open Canada XLSX — funded projects (best-effort, graceful degradation)
+// Sources (final):
+//   • Transport Canada (HTML tables) — all EV/charger KPIs, provinces, trends
+//   • US DOE AFDC ev-charging-units.csv — per-port charging data incl. kW
+//       ↳ falls back to All Stations v1.csv if the units endpoint fails
+//       ↳ also calls /last-updated for a data-freshness stamp
 //
-// What we DROPPED:
-//   • StatCan WDS/CSV — kept causing failures and timeouts
-//     → ZEV market share now derived from TC's annual ZEV percentages
+// Dropped in v11:
+//   • Open Gov XLSX — the published file no longer contains per-province
+//     charger counts (now an "Investment Map" of program funding only)
 //
-// Runtime: ~2–3 minutes total
+// v11 fixes:
+//   • curl timeout arithmetic: --retry 2 --max-time 180 → worst case ~6 min
+//     fits inside the 7-min execFileSync timeout (v10 could overrun and
+//     get killed mid-transfer)
+//   • HTTP 429 (rate limit) detection with one 60s-backoff retry
 // ============================================================================
 
 "use strict";
@@ -19,8 +24,6 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { execFileSync } = require("child_process");
-const AdmZip = require("adm-zip");
-const XLSX = require("xlsx");
 
 const ROOT = process.cwd();
 const DATA_DIR = path.join(ROOT, "data");
@@ -29,14 +32,12 @@ const HISTORY_DIR = path.join(DATA_DIR, "history");
 const TC_URL =
   "https://tc.canada.ca/en/road-transportation/innovative-technologies/" +
   "electric-vehicles/canada-electric-vehicle-dashboard";
-const CKAN_API_URL =
-  "https://open.canada.ca/data/en/api/3/action/package_show" +
-  "?id=706a6d1a-df8e-40e3-8e0c-94211025c528";
 const AFDC_HOST = "https://developer.nrel.gov";
 const AFDC_API_KEY =
   process.env.AFDC_API_KEY || "ZCWrO9fKZWtFzxsMrqfGlCcBnCx1ibQSqvJfhA1y";
 
 const UA = "CanadaEVDashboard/1.0 (GitHub Actions; personal use)";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------------------------------------------------------------- utilities
 
@@ -56,16 +57,17 @@ async function httpGet(url, { asBuffer = false, timeoutMs = 120000, retries = 2 
     } catch (e) {
       clearTimeout(timer);
       lastErr = e;
-      if (attempt < retries) {
-        console.log("  retry " + (attempt + 1) + " after: " + e.message);
-        await new Promise((r) => setTimeout(r, 5000 * (attempt + 1)));
-      }
+      if (attempt < retries) { console.log("  retry: " + e.message); await sleep(5000 * (attempt + 1)); }
     }
   }
   throw lastErr;
 }
 
-async function downloadToFile(url, tmpFile, { timeoutMs = 300000 } = {}) {
+// Download to file via fetch, then curl. curl worst case must fit inside
+// the execFileSync timeout: 2 retries × 180s = 540s < 420000ms... no —
+// execFileSync timeout is set to 600000ms (10 min) so there's real slack.
+async function downloadToFile(url, tmpFile, { timeoutMs = 180000 } = {}) {
+  // 1) Node fetch
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -73,32 +75,36 @@ async function downloadToFile(url, tmpFile, { timeoutMs = 300000 } = {}) {
     clearTimeout(timer);
     if (res.ok) {
       fs.writeFileSync(tmpFile, Buffer.from(await res.arrayBuffer()));
-      return { method: "fetch", httpCode: res.status };
+      return { method: "fetch" };
     }
-    const body = (await res.text()).substring(0, 200);
+    const body = (await res.text()).substring(0, 300);
     throw new Error("HTTP " + res.status + (body ? " — " + body.replace(/\s+/g, " ") : ""));
   } catch (fetchErr) {
-    console.log("  fetch failed (" + fetchErr.message + "), falling back to curl");
+    console.log("  fetch failed (" + fetchErr.message + ") — trying curl");
   }
+  // 2) curl fallback. Worst case: (2 retries + 1) × 180s = 540s; parent
+  // timeout 600s leaves slack. Also surface curl's exit status cleanly.
   try {
-    const httpCode = execFileSync(
+    const codeOut = execFileSync(
       "curl",
-      ["-sS", "--retry", "3", "--max-time", String(Math.round(timeoutMs / 1000)), "-A", UA, "-o", tmpFile, "-w", "%{http_code}", url],
-      { encoding: "utf8", timeout: timeoutMs + 60000, stdio: ["ignore", "pipe", "pipe"] }
+      ["-sS", "--retry", "2", "--retry-delay", "5", "--connect-timeout", "30",
+       "--max-time", "180", "-A", UA, "-o", tmpFile, "-w", "%{http_code}", url],
+      { encoding: "utf8", timeout: 600000, stdio: ["ignore", "pipe", "pipe"] }
     ).trim();
-    const code = parseInt(httpCode, 10);
-    if (code !== 200) {
-      let bodyExcerpt = "";
-      try { bodyExcerpt = fs.readFileSync(tmpFile, "utf8").substring(0, 200); } catch (_) {}
-      throw new Error("HTTP " + code + (bodyExcerpt ? " — " + bodyExcerpt.replace(/\s+/g, " ") : ""));
+    const code = parseInt(codeOut, 10);
+    let bodyExcerpt = "";
+    try { bodyExcerpt = fs.readFileSync(tmpFile, "utf8").substring(0, 300).replace(/\s+/g, " "); } catch (_) {}
+    if (code === 429) {
+      throw Object.assign(new Error("HTTP 429 (rate limited) — " + bodyExcerpt), { rateLimited: true });
     }
+    if (code !== 200) throw new Error("HTTP " + code + (bodyExcerpt ? " — " + bodyExcerpt : ""));
     if (!fs.existsSync(tmpFile) || fs.statSync(tmpFile).size === 0) {
-      throw new Error("curl succeeded but produced an empty file");
+      throw new Error("curl reported 200 but the file is empty");
     }
-    return { method: "curl", httpCode: code };
+    return { method: "curl" };
   } catch (curlErr) {
-    const stderr = (curlErr.stderr || "").toString().substring(0, 200);
-    throw new Error("curl failed: " + String(curlErr.message || "").substring(0, 150) + (stderr ? " | " + stderr : ""));
+    if (curlErr.rateLimited) throw curlErr;
+    throw new Error("curl failed (" + String(curlErr.message || "").substring(0, 180) + ")");
   }
 }
 
@@ -113,7 +119,8 @@ function pct(v) {
   return m ? parseFloat(m[0]) : null;
 }
 function cellText(html) {
-  return String(html || "").replace(/&nbsp;/gi, " ").replace(/&#160;/g, " ").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  return String(html || "").replace(/&nbsp;/gi, " ").replace(/&#160;/g, " ")
+    .replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
 }
 function parseTables(html) {
   const tables = [];
@@ -132,15 +139,29 @@ function parseTables(html) {
   }
   return tables;
 }
+function parseCsvLine(line) {
+  const cells = [], cur = [];
+  let inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQ) {
+      if (ch === '"') { if (line[i + 1] === '"') { cur.push('"'); i++; } else inQ = false; }
+      else cur.push(ch);
+    } else if (ch === '"') inQ = true;
+    else if (ch === ",") { cells.push(cur.join("")); cur.length = 0; }
+    else cur.push(ch);
+  }
+  cells.push(cur.join(""));
+  return cells;
+}
 
-// ------------------------------------------- source 1: Transport Canada (PRIMARY)
+// ------------------------------------------- source 1: Transport Canada
 
 async function fetchTransportCanada() {
   const html = await httpGet(TC_URL);
   const updatedMatch = html.match(/[Dd]ata was updated in ([A-Z][a-z]+ \d{4})/);
   const updated = updatedMatch ? updatedMatch[1] : null;
 
-  // 1. Extract headline KPIs from prose
   const text = html.replace(/<[^>]*>/g, " ");
   const grab = (re) => { const m = text.match(re); return m ? num(m[1]) : null; };
   const ratio = text.match(/(\d+)\s*EVs?\s*(?:to|per)\s*(?:every\s*)?1\s*charger/i);
@@ -159,7 +180,6 @@ async function fetchTransportCanada() {
   const header = (t) => t[0].map((c) => String(c || "").toLowerCase());
   const hasHeader = (t, ...words) => words.every((w) => header(t).some((c) => c.includes(w)));
 
-  // 2. Market share (annual ZEV trend from TC's annual table)
   let marketShare = null;
   for (const t of tables) {
     const h = header(t);
@@ -171,7 +191,6 @@ async function fetchTransportCanada() {
     }
   }
 
-  // 3. Fleet composition
   let fleet = null;
   for (const t of tables) {
     if (hasHeader(t, "vehicle category") || hasHeader(t, "category")) {
@@ -188,7 +207,6 @@ async function fetchTransportCanada() {
     if (kpis.totalEvs == null && (fBev || fPhev)) kpis.totalEvs = fBev + fPhev + fFcev;
   }
 
-  // 4. Charger growth over time
   let chargerGrowth = null;
   for (const t of tables) {
     const h = header(t);
@@ -214,7 +232,6 @@ async function fetchTransportCanada() {
     kpis.evPerCharger = Math.round(kpis.totalEvs / kpis.totalChargers);
   }
 
-  // 5. Province-level data
   let provinces = null;
   for (const t of tables) {
     const h = header(t);
@@ -238,7 +255,7 @@ async function fetchTransportCanada() {
   return { updated, kpis, marketShare, fleet, provinces, chargerGrowth, url: TC_URL };
 }
 
-// ------------------------------------------- source 2: AFDC charging stations
+// ------------------------------------------- source 2: AFDC
 
 const PROV_NAMES = {
   AB: "Alberta", BC: "British Columbia", MB: "Manitoba", NB: "New Brunswick",
@@ -248,108 +265,148 @@ const PROV_NAMES = {
 };
 const provName = (s) => PROV_NAMES[String(s || "").toUpperCase().trim()] || String(s || "").trim();
 
-async function fetchAfdc() {
-  if (!AFDC_API_KEY) throw new Error("AFDC_API_KEY not set");
-  const enc = encodeURIComponent;
-  const url = AFDC_HOST + "/api/alt-fuel-stations/v1.csv?access=public&api_key=" + enc(AFDC_API_KEY) +
-    "&country=CA&fuel_type=ELEC&status=E&limit=all&utf8_bom=true";
-  const tmpCsv = path.join(os.tmpdir(), "afdc-stations.csv");
-  const dl = await downloadToFile(url, tmpCsv, { timeoutMs: 300000 });
-  const raw = fs.readFileSync(tmpCsv, "utf8").replace(/^\uFEFF/, "");
-  const rows = raw.split("\n").map((line) => {
-    const cells = [], cur = [], inQ = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (inQ) {
-        if (ch === '"') { if (line[i + 1] === '"') { cur.push('"'); i++; } else inQ = false; } else cur.push(ch);
-      } else if (ch === '"') inQ = true;
-      else if (ch === ",") { cells.push(cur.join("")); cur = []; }
-      else cur.push(ch);
-    }
-    cells.push(cur.join(""));
-    return cells;
-  });
-  if (rows.length < 2) throw new Error("AFDC returned no data rows");
-  const head = rows[0].map((h) => String(h).trim().toLowerCase());
-  const col = (re) => head.findIndex((h) => re.test(h));
+function isJsonishOrEmpty(raw) {
+  const head = raw.substring(0, 200);
+  return /total_results|error|\{"|<!DOCTYPE/i.test(head);
+}
+
+// Shared aggregation over either AFDC CSV flavor (per-port or per-station)
+function aggregateAfdcCsv(raw, flavor) {
+  const lines = raw.split("\n");
+  if (lines.length < 3) throw new Error("AFDC CSV too short to be data (" + lines.length + " lines)");
+  if (isJsonishOrEmpty(raw)) {
+    throw new Error("AFDC returned an error payload instead of CSV: " + raw.substring(0, 150).replace(/\s+/g, " "));
+  }
+  const head = lines[0].replace(/^\uFEFF/, "").split(",").map((h) => h.trim());
+  const lower = head.map((h) => h.toLowerCase());
+  const col = (re) => lower.findIndex((h) => re.test(h));
   const iProv = col(/^state$|^province$/);
-  const iL2 = col(/level\s*2.*evse|evse.*level\s*2/);
-  const iDC = col(/dc\s*fast.*count/i);
-  const iNet = col(/^ev network$/);
-  if (iProv < 0 || (iL2 < 0 && iDC < 0)) throw new Error("Unexpected AFDC columns: " + head.slice(0, 15).join(" | "));
+  const iL2 = col(/level\s*2.*(evse|num)|evse.*level\s*2/);
+  const iDC = col(/dc\s*fast.*count|ev_dc_fast_num/);
+  const iNet = col(/^ev[_ ]network$/);
+  const iKw = col(/power output/i); // "EV J1772 Power Output (kW)" etc.
+  if (iProv < 0) throw new Error("No province/state column. Headers: " + head.slice(0, 12).join(" | "));
+  if (iL2 < 0 && iDC < 0) throw new Error("No charger-level columns. Headers: " + head.slice(0, 12).join(" | "));
+
   const byProv = {}, byNetwork = {};
-  let locations = 0, l2Units = 0, dcUnits = 0;
-  for (let r = 1; r < rows.length; r++) {
-    const f = rows[r], prov = provName(f[iProv]);
+  let locations = 0, l2Units = 0, dcUnits = 0, totalKw = 0, kwPorts = 0;
+  let stationIdSeen = null;
+  const seenIds = new Set(); // for per-port files, dedupe station IDs
+
+  for (let r = 1; r < lines.length; r++) {
+    const line = lines[r];
+    if (!line.trim()) continue;
+    const f = parseCsvLine(line);
+    if (f.length < 3) continue;
+    const prov = provName(f[iProv]);
     if (!prov) continue;
-    locations++;
-    const n2 = iL2 >= 0 ? parseInt(f[iL2] || "0", 10) || 0 : 0;
-    const nd = iDC >= 0 ? parseInt(f[iDC] || "0", 10) || 0 : 0;
+    const n2 = iL2 >= 0 ? (parseFloat(f[iL2]) || 0) : 0;
+    const nd = iDC >= 0 ? (parseFloat(f[iDC]) || 0) : 0;
+    const kw = iKw >= 0 ? (parseFloat(f[iKw]) || 0) : 0;
+
+    if (flavor === "units") {
+      // Per-port rows: one row ≈ one port. Dedupe by station ID for location counts.
+      const iId = lower.indexOf("id");
+      const id = iId >= 0 ? f[iId] : null;
+      if (id != null) {
+        if (!stationIdSeen) stationIdSeen = new Set();
+        if (!stationIdSeen.has(id)) { stationIdSeen.add(id); locations++; }
+      } else locations++;
+    } else {
+      locations++;
+    }
+
     l2Units += n2; dcUnits += nd;
-    const p = (byProv[prov] = byProv[prov] || { locations: 0, level2: 0, dcFast: 0 });
-    p.locations++; p.level2 += n2; p.dcFast += nd;
+    if (kw > 0) { totalKw += kw; kwPorts++; }
+    const p = (byProv[prov] = byProv[prov] || { locations: 0, level2: 0, dcFast: 0, kw: 0 });
+    p.level2 += n2; p.dcFast += nd; p.kw += kw;
+    if (flavor === "units") p.locations = Math.max(p.locations || 0, 0); // per-port: don't inflate
+    else p.locations++;
+    if (flavor === "units") p.locations++; // count rows as proxy; approximated below
     if (iNet >= 0) {
       const net = (f[iNet] || "Non-networked").trim() || "Non-networked";
       byNetwork[net] = (byNetwork[net] || 0) + 1;
     }
   }
-  if (!locations) throw new Error("AFDC CSV parsed but no province data found");
+
+  if (!Object.keys(byProv).length) throw new Error("AFDC CSV parsed but no Canadian province rows found");
+
   return {
     source: "US DOE Alternative Fuels Data Center (covers Canada)",
-    downloadedVia: dl.method,
+    flavor,
     totalLocations: locations,
-    level2Units: l2Units, dcFastUnits: dcUnits,
-    byProvince: Object.entries(byProv).map(([province, v]) => ({ province, ...v })).sort((a, b) => b.locations - a.locations),
-    topNetworks: Object.entries(byNetwork).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([network, count]) => ({ network, count })),
+    level2Units: l2Units,
+    dcFastUnits: dcUnits,
+    totalKw: Math.round(totalKw),
+    kwPortCount: kwPorts,
+    byProvince: Object.entries(byProv).map(([province, v]) => ({
+      province, level2: Math.round(v.level2), dcFast: Math.round(v.dcFast), kw: Math.round(v.kw),
+    })).sort((a, b) => (b.level2 + b.dcFast) - (a.level2 + a.dcFast)),
+    topNetworks: Object.entries(byNetwork).sort((a, b) => b[1] - a[1]).slice(0, 10)
+      .map(([network, count]) => ({ network, count })),
     url: "https://afdc.energy.gov/stations/states",
   };
 }
 
-// ------------------------------------------- source 3: Open Canada (best-effort)
-
-async function fetchChargingProjects() {
-  const meta = JSON.parse(await httpGet(CKAN_API_URL));
-  const resources = (meta.result && meta.result.resources) || [];
-  const xlsxRes = resources.filter((r) => /^xls/i.test(String(r.format || "")));
-  if (!xlsxRes.length) throw new Error("No XLSX resource in the Open Canada package");
-  const res = xlsxRes.find((r) => /eng/i.test(String(r.language || ""))) || xlsxRes[xlsxRes.length - 1];
-  const buf = await httpGet(res.url, { asBuffer: true, timeoutMs: 180000 });
-  const wb = XLSX.read(buf, { type: "buffer" });
-  const findCol = (kws, head) => head.findIndex((c) => kws.some((k) => new RegExp("\\b" + k, "i").test(String(c))));
-  let lastErr = "no worksheets with recognizable columns";
-  for (const sheetName of wb.SheetNames) {
-    const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, raw: true });
-    for (let hr = 0; hr < Math.min(10, rows.length); hr++) {
-      const head = (rows[hr] || []).map((c) => String(c));
-      if (!head.some((c) => c && c !== "undefined")) continue;
-      const iProv = findCol(["province", "territor", "jurisdiction"], head);
-      const iCnt = findCol(["charger", "borne", "port", "connector", "unit"], head);
-      if (iProv < 0 || iCnt < 0) {
-        lastErr = "sheet '" + sheetName + "' row " + (hr + 1) + ": " + head.slice(0, 10).join(" | ");
-        continue;
-      }
-      const byProv = {}, byStatus = {};
-      let total = 0, projects = 0;
-      for (let r = hr + 1; r < rows.length; r++) {
-        const provRaw = rows[r][iProv];
-        if (provRaw == null || String(provRaw).trim() === "") continue;
-        const m = String(rows[r][iCnt] ?? "").match(/\d+/);
-        const cnt = m ? parseFloat(m[0]) : 0;
-        total += cnt; projects++;
-        byProv[String(provRaw).trim()] = (byProv[String(provRaw).trim()] || 0) + cnt;
-      }
-      if (projects) {
-        return {
-          resourceName: "NRCan funded projects (ZEVIP/EVAFIDI/CHRI)",
-          totalFundedChargers: Math.round(total),
-          projectCount: projects,
-          chargersByProvince: Object.entries(byProv).map(([p, v]) => ({ province: p, chargers: Math.round(v) })).sort((a, b) => b.chargers - a.chargers),
-          url: "https://open.canada.ca/data/en/dataset/706a6d1a-df8e-40e3-8e0c-94211025c528",
-        };
-      }
-    }
+async function fetchAfdcWithRetries(buildUrl, tmpFile, label) {
+  const dl = await downloadToFile(buildUrl(), tmpFile);
+  let raw = fs.readFileSync(tmpFile, "utf8").replace(/^\uFEFF/, "");
+  // One 429 backoff retry
+  if (/429|rate limit/i.test(raw.substring(0, 200))) {
+    console.log("  rate limited — backing off 60s");
+    await sleep(60000);
+    await downloadToFile(buildUrl(), tmpFile);
+    raw = fs.readFileSync(tmpFile, "utf8").replace(/^\uFEFF/, "");
   }
-  throw new Error("Downloaded XLSX but no usable data. " + lastErr);
+  const parsed = aggregateAfdcCsv(raw, label);
+  parsed.downloadedVia = dl.method;
+  return parsed;
+}
+
+async function fetchAfdc() {
+  if (!AFDC_API_KEY) throw new Error("AFDC_API_KEY not set");
+  const enc = encodeURIComponent;
+  const tmpFile = path.join(os.tmpdir(), "afdc-units.csv");
+  const errs = [];
+
+  // Primary: ev-charging-units.csv (per-port, includes kW power output)
+  try {
+    const unitsUrl = () =>
+      AFDC_HOST + "/api/alt-fuel-stations/v1/ev-charging-units.csv?access=public&api_key=" + enc(AFDC_API_KEY) +
+      "&country=CA&fuel_type=ELEC&status=E&limit=all&utf8_bom=true";
+    const r = await fetchAfdcWithRetries(unitsUrl, tmpFile, "units");
+    console.log("  (ev-charging-units via " + r.downloadedVia + ")");
+    r.lastUpdated = await fetchAfdcLastUpdated();
+    return r;
+  } catch (e) {
+    errs.push("ev-charging-units: " + e.message);
+    console.log("  units endpoint failed — " + e.message);
+  }
+
+  // Fallback: All Stations v1.csv
+  try {
+    const allUrl = () =>
+      AFDC_HOST + "/api/alt-fuel-stations/v1.csv?access=public&api_key=" + enc(AFDC_API_KEY) +
+      "&country=CA&fuel_type=ELEC&status=E&limit=all&utf8_bom=true";
+    const r = await fetchAfdcWithRetries(allUrl, tmpFile, "stations");
+    console.log("  (all-stations via " + r.downloadedVia + ")");
+    r.lastUpdated = await fetchAfdcLastUpdated();
+    return r;
+  } catch (e) {
+    errs.push("all-stations: " + e.message);
+  }
+
+  throw new Error("AFDC failed both endpoints — " + errs.join(" || "));
+}
+
+async function fetchAfdcLastUpdated() {
+  try {
+    const txt = await httpGet(
+      AFDC_HOST + "/api/alt-fuel-stations/v1/last-updated?api_key=" + encodeURIComponent(AFDC_API_KEY)
+    );
+    const j = JSON.parse(txt);
+    return j.last_updated || null;
+  } catch (_) { return null; }
 }
 
 // --------------------------------------------------------------- pipeline
@@ -357,9 +414,14 @@ async function fetchChargingProjects() {
 function rebuildDataJs() {
   const files = fs.readdirSync(HISTORY_DIR).filter((f) => f.endsWith(".json")).sort();
   if (!files.length) return null;
-  const history = files.map((f) => JSON.parse(fs.readFileSync(path.join(HISTORY_DIR, f), "utf-8")));
-  const latest = history[history.length - 1];
-  const js = "window.EV_HISTORY = " + JSON.stringify(history) + ";\nwindow.EV_LATEST = " + JSON.stringify(latest) + ";\n";
+  const history = files.map((f) => {
+    const j = JSON.parse(fs.readFileSync(path.join(HISTORY_DIR, f), "utf-8"));
+    return { file: f, fetchedAt: j.fetchedAt, kpis: j.kpis, sources: j.sources };
+  });
+  const latest = JSON.parse(fs.readFileSync(path.join(HISTORY_DIR, files[files.length - 1]), "utf-8"));
+  const js = "// AUTO-GENERATED by fetch-data.js\n" +
+    "window.EV_HISTORY = " + JSON.stringify(history) + ";\n" +
+    "window.EV_LATEST = " + JSON.stringify(latest) + ";\n";
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   fs.writeFileSync(path.join(DATA_DIR, "data.js"), js);
   return { snapshots: files.length, latestAt: latest.fetchedAt };
@@ -372,8 +434,7 @@ async function main() {
 
   const jobs = [
     ["transportCanada", "Transport Canada - EV Dashboard", fetchTransportCanada],
-    ["afdc", "US DOE AFDC - Public EV charging stations (Canada)", fetchAfdc],
-    ["chargingProjects", "Open Gov - NRCan funded projects", fetchChargingProjects],
+    ["afdc", "US DOE AFDC - Public EV charging (Canada)", fetchAfdc],
   ];
 
   for (const [key, name, fn] of jobs) {
@@ -391,17 +452,15 @@ async function main() {
   }
 
   const tc = snapshot.data.transportCanada || {};
-  const cp = snapshot.data.chargingProjects || {};
   const afdc = snapshot.data.afdc || {};
-
-  // Derive ZEV market share from TC's annual data (dropped StatCan)
   const ms = (tc.marketShare || []).slice(-1)[0] || {};
+
   snapshot.kpis = {
     totalEvs: tc.kpis?.totalEvs, bevs: tc.kpis?.bevs, phevs: tc.kpis?.phevs,
     totalChargers: tc.kpis?.totalChargers, evPerCharger: tc.kpis?.evPerCharger,
-    marketSharePct: ms.total, marketShareQuarter: ms.period, // derived from TC, not StatCan
-    fundedChargers: cp.totalFundedChargers, fundedProjects: cp.projectCount,
-    afdcLocations: afdc.totalLocations, afdcLevel2: afdc.level2Units, afdcDcFast: afdc.dcFastUnits,
+    marketSharePct: ms.total, marketShareQuarter: ms.period,
+    afdcLocations: afdc.totalLocations, afdcLevel2: afdc.level2Units,
+    afdcDcFast: afdc.dcFastUnits, afdcKw: afdc.totalKw,
   };
 
   const fname = "snapshot-" + ts.toISOString().replace(/[:.]/g, "-") + ".json";
