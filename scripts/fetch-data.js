@@ -33,8 +33,7 @@ const CKAN_API_URL =
   "https://open.canada.ca/data/en/api/3/action/package_show" +
   "?id=706a6d1a-df8e-40e3-8e0c-94211025c528";
 const AFDC_HOST = "https://developer.nrel.gov";
-const AFDC_API_KEY = process.env.AFDC_API_KEY || "";
-
+   const AFDC_API_KEY = "ZCWrO9fKZWtFzxsMrqfGlCcBnCx1ibQSqvJfhA1y";
 const UA = "CanadaEVDashboard/1.0 (GitHub Actions; personal use)";
 
 // ---------------------------------------------------------------- utilities
