@@ -1,16 +1,22 @@
 // ============================================================================
-// scripts/fetch-data.js — v11.1
+// scripts/fetch-data.js — v11.2
 //
-// THE FIX: AFDC host corrected to developer.nlr.gov (the domain in the
-// working browser URL — v11 wrongly used developer.nrel.gov, causing
-// connection-level failures from both Node fetch and curl).
+// TEST BUILD: uses the shared DEMO_KEY for AFDC instead of a personal key.
+//
+//   DEMO_KEY is documented for exploring the API before signing up:
+//     30 requests/hour and 50/day, per IP address.
+//   A monthly run makes ~3 requests, so it fits — BUT GitHub Actions
+//   runners share IP pools, so other users can exhaust the quota and you
+//   may see HTTP 429. That's the shared key, not the code.
+//
+//   When you have your own key from developer.nlr.gov/signup, replace
+//   DEMO_KEY below (or set the AFDC_API_KEY repository secret).
 //
 // Sources:
-//   • Transport Canada (HTML tables) — all EV/charger KPIs, provinces, trends
-//   • US DOE AFDC ev-charging-units.csv — per-port charging data incl. kW
-//       ↳ falls back to All Stations v1.csv if the units endpoint fails
-//       ↳ also calls /last-updated for a data-freshness stamp
-//   • Open Gov XLSX — dropped (dataset no longer contains usable data)
+//   • Transport Canada (HTML tables) — EV/charger KPIs, provinces, trends
+//   • US DOE AFDC ev-charging-units.csv — per-port data incl. kW
+//       ↳ falls back to All Stations v1.csv
+//       ↳ also calls /last-updated for a freshness stamp
 // ============================================================================
 
 "use strict";
@@ -28,8 +34,11 @@ const TC_URL =
   "https://tc.canada.ca/en/road-transportation/innovative-technologies/" +
   "electric-vehicles/canada-electric-vehicle-dashboard";
 const AFDC_HOST = "https://developer.nlr.gov";
-const AFDC_API_KEY =
-  process.env.AFDC_API_KEY || "ZCWrO9fKZWtFzxsMrqfGlCcBnCx1ibQSqvJfhA1y";
+
+// >>> SWAP THIS LINE when you have your own key <<<
+const AFDC_API_KEY = process.env.AFDC_API_KEY || "DEMO_KEY";
+// previous key (returned 403 API_KEY_UNAUTHORIZED):
+// "ZCWrO9fKZWtFzxsMrqfGlCcBnCx1ibQSqvJfhA1y"
 
 const UA = "CanadaEVDashboard/1.0 (GitHub Actions; personal use)";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -301,7 +310,7 @@ function aggregateAfdcCsv(raw, flavor) {
     const nd = iDC >= 0 ? (parseFloat(f[iDC]) || 0) : 0;
     const kw = iKw >= 0 ? (parseFloat(f[iKw]) || 0) : 0;
 
-    // Location counting: per-port files have repeated station IDs — dedupe.
+    // Location counting: per-port files repeat station IDs — dedupe them.
     if (flavor === "units") {
       const iId = lower.indexOf("id");
       const id = iId >= 0 && f[iId] ? f[iId] : null;
@@ -344,8 +353,8 @@ function aggregateAfdcCsv(raw, flavor) {
 async function fetchAfdcWithRetries(buildUrl, tmpFile, label) {
   const dl = await downloadToFile(buildUrl(), tmpFile);
   let raw = fs.readFileSync(tmpFile, "utf8").replace(/^\uFEFF/, "");
-  // One 429 backoff retry
-  if (/429|rate limit/i.test(raw.substring(0, 200))) {
+  // One 429 backoff retry (DEMO_KEY shares an IP quota, so this matters)
+  if (/429|rate limit|OVER_RATE_LIMIT/i.test(raw.substring(0, 300))) {
     console.log("  rate limited — backing off 60s");
     await sleep(60000);
     await downloadToFile(buildUrl(), tmpFile);
@@ -362,8 +371,7 @@ async function fetchAfdc() {
   const tmpFile = path.join(os.tmpdir(), "afdc-units.csv");
   const errs = [];
 
-  // Primary: ev-charging-units.csv (per-port, includes kW power output).
-  // Parameter set matches the browser-proven URL, minus non-EV fuel filters.
+  // Primary: ev-charging-units.csv (per-port, includes kW power output)
   try {
     const unitsUrl = () =>
       AFDC_HOST + "/api/alt-fuel-stations/v1/ev-charging-units.csv?access=public&api_key=" + enc(AFDC_API_KEY) +
