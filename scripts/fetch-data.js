@@ -321,7 +321,7 @@ const quarterFromRefPer = (refPer) => {
 
 async function fetchStatcanViaWds() {
   // 1. Metadata: discover dimensions and members
-  const metaArr = await wdsPost("/getCubeMetadata", [{ productId: 2010002501 }]);
+  const metaArr = await wdsPost("/getCubeMetadata", [{ productId: 20100025 }]);
   if (!Array.isArray(metaArr) || !metaArr[0] || metaArr[0].status !== "SUCCESS" || !metaArr[0].object) {
     throw new Error("WDS metadata request did not return SUCCESS");
   }
@@ -374,7 +374,7 @@ async function fetchStatcanViaWds() {
   for (const [label, fuelIdx] of wanted) {
     if (fuelIdx < 0) continue;
     const resp = await wdsPost("/getDataFromCubePidCoordAndLatestNPeriods", {
-      id: 2010002501,
+      id: 20100025,
       coordinates: [buildCoord(fuelIdx)],
       nRecentPeriods: 44,
     });
