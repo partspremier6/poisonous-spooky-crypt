@@ -1,18 +1,14 @@
 // ============================================================================
-// FILE: scripts/fetch-data.js   (v4 - Nov 2026)
+// FILE: scripts/fetch-data.js   (v5 - Nov 2026)
 // ----------------------------------------------------------------------------
-// Big change in this version - StatCan now uses the official Web Data
-// Service (WDS) REST API instead of the giant bulk CSV:
-//
-//   1. POST /getCubeMetadata for product 2010002501 (discovers dimensions)
-//   2. Locate the Geography / Vehicle type / Fuel type dimensions and their
-//      member IDs (Canada, Total vehicles, each fuel type)
-//   3. POST /getDataFromCubePidCoordAndLatestNPeriods for the last N
-//      quarters of each Canada-level series - tiny responses, no bulk file
-//
-// If the WDS API fails for any reason, the script automatically falls back
-// to the v3 CSV-streaming parser, so the source can never come back
-// completely empty.
+// Changes in this version:
+//   1. Open Canada XLSX: headers have changed to "Organization | Initiative | ..."
+//      - Try all worksheets, not just the first one
+//      - Broaden column search: look for any geography/province/territory/jurisdiction
+//        and any count/port/charger/connector column
+//      - Print full header on failure so we can diagnose
+//   2. StatCan WDS API with CSV fallback (as in v4)
+//   3. Transport Canada unchanged
 // ============================================================================
 
 "use strict";
@@ -205,7 +201,6 @@ async function fetchTransportCanada() {
 
 // ------------------------------------------------- source 2: StatCan (WDS API)
 
-// Flatten a dimension's members (defensive: some cubes nest them)
 function flattenMembers(dim) {
   const out = [];
   const walk = (members) => {
@@ -225,7 +220,6 @@ function memberCoordId(m, fallbackIndex) {
 }
 
 async function fetchStatcanWds() {
-  // ---- 1. Metadata (as in the user's snippet) ----
   const metaResult = await wdsPost("/getCubeMetadata", [
     { productId: STATCAN_PRODUCT_ID },
   ]);
@@ -246,7 +240,6 @@ async function fetchStatcanWds() {
 
   const withMembers = dims.map((d) => ({ dim: d, members: flattenMembers(d) }));
 
-  // ---- 2. Choose the members we want ----
   const geoHolder = withMembers.find((h) => /geograph/i.test(h.dim.dimensionNameEn));
   const vehHolder = withMembers.find((h) => /vehicle\s*type/i.test(h.dim.dimensionNameEn));
   const fuelHolder = withMembers.find((h) => /fuel\s*type/i.test(h.dim.dimensionNameEn));
@@ -258,21 +251,17 @@ async function fetchStatcanWds() {
 
   const nameOf = (m) => m.memberNameEn || m.memberNameFr || "";
 
-  // Canada (may be listed as "Canada" or an aggregate like "Total, Canada")
   const canadaMember = geoHolder.members.find(
     (m) => /^(total,?\s*)?canada$/i.test(nameOf(m).trim())
   ) || geoHolder.members.find((m) => /\bcanada\b/i.test(nameOf(m)));
   if (!canadaMember) throw new Error("WDS: no 'Canada' member in geography dimension");
 
-  // Vehicle type: prefer a "Total ..." member; otherwise the first member
   let vehMember = null;
   if (vehHolder) {
     vehMember = vehHolder.members.find((m) => /^total/i.test(nameOf(m))) ||
                 vehHolder.members[0];
   }
 
-  // Any remaining dimension (e.g. seasonal adjustment): take a total-like
-  // member, or the first one
   const chosen = withMembers.map((h) => {
     if (h === geoHolder) return { holder: h, member: canadaMember };
     if (vehHolder && h === vehHolder) return { holder: h, member: vehMember };
@@ -280,9 +269,8 @@ async function fetchStatcanWds() {
     return { holder: h, member: pick };
   });
 
-  // ---- 3. Request data for each fuel type, Canada-level ----
   const fuelMembers = fuelHolder.members;
-  const N_PERIODS = 48; // ~12 years of quarters; API returns what exists
+  const N_PERIODS = 48;
 
   const requests = fuelMembers.map((fm) => ({
     productId: STATCAN_PRODUCT_ID,
@@ -297,17 +285,15 @@ async function fetchStatcanWds() {
   try {
     dataResults = await wdsPost("/getDataFromCubePidCoordAndLatestNPeriods", requests);
   } catch (e) {
-    // Some cubes reject requests for more periods than exist - retry smaller
     requests.forEach((r) => (r.recentNPeriods = 20));
     dataResults = await wdsPost("/getDataFromCubePidCoordAndLatestNPeriods", requests);
   }
 
-  // ---- 4. Assemble series: quarter -> { fuelName: value } ----
   const series = {};
   let okCount = 0;
   dataResults.forEach((resObj, i) => {
     const fuelName = nameOf(fuelMembers[i]).trim();
-    if (resObj.status !== "SUCCESS" || !resObj.object) return; // skip failures
+    if (resObj.status !== "SUCCESS" || !resObj.object) return;
     okCount++;
     for (const point of resObj.object.vectorDataPoint || []) {
       const quarter = String(point.refPer || "").trim();
@@ -322,7 +308,6 @@ async function fetchStatcanWds() {
       JSON.stringify(dataResults).substring(0, 300));
   }
 
-  // ---- 5. Classify fuels and build registrations ----
   const fuels = Object.keys(series).flatMap((q) => Object.keys(series[q]));
   const fuelNames = [...new Set(fuels)];
   const bevLabel = fuelNames.find((f) => /battery\s*electric/i.test(f));
@@ -340,7 +325,6 @@ async function fetchStatcanWds() {
     const phev = (phevLabel && d[phevLabel]) || 0;
     let total = totalFuel ? d[totalFuel] : null;
     if (total == null) {
-      // no explicit total fuel member: sum all individual fuels
       total = Object.entries(d)
         .filter(([f]) => f !== totalFuel)
         .reduce((s, [, v]) => s + v, 0);
@@ -364,8 +348,6 @@ async function fetchStatcanWds() {
     url: "https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=2010002501",
   };
 }
-
-// ------------------------------- source 2 fallback: StatCan bulk CSV (v3 parser)
 
 async function fetchStatcanCsv() {
   const buf = await getBuffer(STATCAN_CSV_URL);
@@ -462,7 +444,7 @@ async function fetchStatcan() {
   }
 }
 
-// -------------------------------------------- source 3: Open Canada charging projects
+// -------------------------------------------- source 3: Open Canada charging projects (v5 - flexible)
 
 async function findXlsxResource() {
   for (const base of CKAN_BASES) {
@@ -489,57 +471,114 @@ async function findXlsxResource() {
   return { url: new URL(href, OPENCANADA_DATASET_PAGE).href, via: "dataset page" };
 }
 
-async function fetchChargingProjects() {
-  const { url: xlsxUrl, via } = await findXlsxResource();
+function findColumn(head, keywords) {
+  // First try exact substring match
+  const idx = head.findIndex((c) => keywords.some((k) => c.toLowerCase().includes(k)));
+  if (idx >= 0) return idx;
+  // Fall back to word-boundary match
+  for (let i = 0; i < head.length; i++) {
+    const col = head[i].toLowerCase();
+    if (keywords.some((k) => {
+      const re = new RegExp("\\b" + k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "i");
+      return re.test(col);
+    })) return i;
+  }
+  return -1;
+}
 
-  const buf = await getBuffer(xlsxUrl);
-  const wb = XLSX.read(buf, { type: "buffer" });
-  const ws = wb.Sheets[wb.SheetNames[0]];
+async function fetchChargingProjectsSheet(ws, xlsxUrl) {
   const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true });
-  const head = rows[0].map((c) => String(c));
+  if (!rows.length) return null;
 
-  const findCol = (keywords) =>
-    head.findIndex((c) => keywords.some((k) => c.toLowerCase().includes(k)));
+  const head = rows[0].map((c) => String(c).trim());
 
-  const iProv = findCol(["province", "prov", "state"]);
-  const iCnt = findCol(["charger", "borne", "number of"]);
-  const iStatus = findCol(["status"]);
+  // Broader keyword sets for province and charger count
+  const provKeywords = ["province", "prov", "territory", "jurisdiction", "region", "location", "area"];
+  const cntKeywords = ["charger", "port", "connector", "borne", "number of", "count", "units"];
 
-  if (iProv < 0 || iCnt < 0)
-    throw new Error(
-      "Downloaded the XLSX but could not find province/charger columns. Header: " +
-        head.slice(0, 15).join(" | ")
-    );
+  const iProv = findColumn(head, provKeywords);
+  const iCnt = findColumn(head, cntKeywords);
+
+  const iStatus = findColumn(head, ["status", "operational", "active"]);
+
+  if (iProv < 0 || iCnt < 0) {
+    // Return null so the caller tries another sheet
+    return null;
+  }
 
   const byProv = {}, byStatus = {};
   let total = 0, projects = 0;
   for (let r = 1; r < rows.length; r++) {
-    const provRaw = rows[r][iProv];
-    if (provRaw == null || String(provRaw).trim() === "") continue;
-    const cntMatch = String(rows[r][iCnt]).match(/\d+(\.\d+)?/);
+    const row = rows[r];
+    if (!row || row.length <= Math.max(iProv, iCnt)) continue;
+    const provRaw = row[iProv];
+    if (provRaw == null || String(provRaw).trim() === "" || String(provRaw) === "Canada") continue;
+    const cntMatch = String(row[iCnt] || "").match(/\d+(\.\d+)?/);
     const cnt = cntMatch ? parseFloat(cntMatch[0]) : 0;
     total += cnt;
     projects++;
     const p = String(provRaw).trim();
     byProv[p] = (byProv[p] || 0) + cnt;
-    if (iStatus >= 0) {
-      const s = String(rows[r][iStatus] || "").trim();
+    if (iStatus >= 0 && row[iStatus]) {
+      const s = String(row[iStatus]).trim();
       if (s) byStatus[s] = (byStatus[s] || 0) + 1;
     }
   }
+
+  if (!total) return null;
 
   const chargersByProvince = Object.entries(byProv)
     .map(([province, chargers]) => ({ province, chargers: Math.round(chargers) }))
     .sort((a, b) => b.chargers - a.chargers);
 
   return {
-    resourceName: "Projects funded by the EVAFIDI, ZEVIP and CHRI programs (NRCan)",
-    resourceUrl: xlsxUrl,
-    resourceVia: via,
     totalFundedChargers: Math.round(total),
     projectCount: projects,
     chargersByProvince,
     projectsByStatus: byStatus,
+  };
+}
+
+async function fetchChargingProjects() {
+  const { url: xlsxUrl, via } = await findXlsxResource();
+
+  const buf = await getBuffer(xlsxUrl);
+  const wb = XLSX.read(buf, { type: "buffer" });
+
+  // Try each worksheet until we find one with usable data
+  let result = null;
+  let lastError = null;
+  let lastHeader = null;
+
+  for (const sheetName of wb.SheetNames) {
+    const ws = wb.Sheets[sheetName];
+    result = await fetchChargingProjectsSheet(ws, xlsxUrl);
+    if (result && result.totalFundedChargers) {
+      console.log("  Found data in sheet: " + sheetName);
+      break;
+    }
+    if (ws) {
+      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true });
+      if (rows.length && rows[0]) {
+        lastHeader = rows[0].map((c) => String(c)).slice(0, 15).join(" | ");
+      }
+    }
+    lastError = "No usable province/charger columns found in sheet " + sheetName;
+  }
+
+  if (!result) {
+    throw new Error(
+      "Downloaded the XLSX but could not find province/charger columns in any sheet. " +
+        "Sheet names: [" + wb.SheetNames.join(", ") + "]" +
+        (lastHeader ? ". Last sheet header: " + lastHeader : "")
+    );
+  }
+
+  return {
+    resourceName: "Projects funded by the EVAFIDI, ZEVIP and CHRI programs (NRCan)",
+    resourceUrl: xlsxUrl,
+    resourceVia: via,
+    ...result,
     url: OPENCANADA_DATASET_PAGE,
   };
 }
@@ -608,7 +647,7 @@ async function main() {
     marketSharePct: lastReg.zevSharePct != null ? lastReg.zevSharePct : null,
     marketShareQuarter: lastReg.quarter || null,
     fundedChargers: cp.totalFundedChargers != null ? cp.totalFundedChargers : null,
-    fundedProjects: cp.projectCount != null ? cp.projectCount : null,
+    fundedProjects: cp.projectCount != null ? cp.totalFundedProjects : null,
   };
 
   const fname = "snapshot-" + ts.toISOString().replace(/[:.]/g, "-") + ".json";
