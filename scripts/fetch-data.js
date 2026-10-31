@@ -1,24 +1,24 @@
 // ============================================================================
-// scripts/fetch-data.js — v12
+// scripts/fetch-data.js — v12.1
 //
-// v12 fixes (user-reported):
-//   1. TC province table: numbers were landing in wrong columns (QC showed
-//      "36 EVs" — that was the 36:1 ratio). Now roles are discovered by
-//      PERMUTATION VALIDATION: for each row, try every assignment of the
-//      numbers to (ratio, chargers, evs) and keep the one where
-//      ratio x chargers ~= evs and evs > chargers. Column order no longer
-//      matters.
-//   2. National KPIs: chained fallbacks with sanity bounds — prose parse,
-//      then table-derived, then province sums. evPerCharger outside 5-100
-//      is rejected (kills the 534:1 artifact).
-//   3. AFDC ev-charging-units: per the API docs, each row is a charging
-//      UNIT but the port-count fields ("EV Level2 EVSE Num", etc.) describe
-//      the STATION LOCATION, which can span multiple rows. Rows are now
-//      grouped by Station ID, taking the max per count field per station,
-//      then summed across stations. Station count, row count, and the
-//      raw header line are stored in the snapshot for transparency.
+// v12.1 fix (user-reported):
+//   Dashboard showed "2,017 public chargers" while L2 (30,741) + DC fast
+//   (8,479) summed to 39,220. The prose regex for "Total chargers" had
+//   grabbed a stray year (2017). The province-sum fallback never fired
+//   because the province table yielded <5 validated rows this run.
 //
-// Key: DEMO_KEY (swap for your own from developer.nlr.gov/signup).
+//   FIX: post-parse RECONCILIATION with arithmetic invariants, so no single
+//   bad grab survives:
+//     • If level2 & level3 both exist → totalChargers := level2 + level3
+//       whenever they disagree by >15% (components win).
+//     • If bevs/phevs exist → totalEvs := bevs + phevs + fcev whenever
+//       totalEvs is missing or smaller than the component sum.
+//     • Ratio recomputed last, from reconciled totals.
+//   Plus: the fully parsed KPI set is printed to the run log for debugging.
+//
+// v12 recap: permutation-validated TC province rows (ratio×chargers≈EVs),
+// AFDC ev-charging-units rows grouped by station (docs: port-count fields
+// repeat the station total across unit rows), KPI sanity bounds.
 // ============================================================================
 
 "use strict";
@@ -162,7 +162,6 @@ function assignProvinceNumbers(nums) {
   if (!nums || nums.length < 2) return null;
   if (nums.length === 2) {
     const [a, b] = nums;
-    // two numbers: they must be chargers & evs (evs larger)
     if (a > b && b > 0) return { evPerCharger: null, totalChargers: b, totalEvs: a };
     if (b > a && a > 0) return { evPerCharger: null, totalChargers: a, totalEvs: b };
     return null;
@@ -170,7 +169,7 @@ function assignProvinceNumbers(nums) {
   let best = null, bestScore = Infinity;
   for (let i = 0; i < 3; i++) {
     const rest = [0, 1, 2].filter((j) => j !== i);
-    const r = nums[i]; // candidate ratio
+    const r = nums[i];
     for (const [ci, ei] of [rest, [rest[1], rest[0]]]) {
       const chargers = nums[ci], evs = nums[ei];
       if (!(evs > chargers) || chargers <= 0 || r <= 0) continue;
@@ -185,6 +184,37 @@ function assignProvinceNumbers(nums) {
   return best;
 }
 
+// Enforce arithmetic invariants across the KPI set so no single bad grab
+// survives. Mutates and returns the kpis object.
+function reconcileKpis(k) {
+  // Charger family: components beat the total when they disagree badly.
+  if (k.level2 != null && k.level3 != null) {
+    const sum = k.level2 + k.level3;
+    if (k.totalChargers == null || Math.abs(k.totalChargers - sum) / sum > 0.15) {
+      if (k.totalChargers != null) {
+        console.log("  [reconcile] totalChargers " + k.totalChargers +
+          " disagreed with L2+L3 sum " + sum + " — using component sum");
+      }
+      k.totalChargers = sum;
+    }
+  }
+  // EV family: total can never be less than its components.
+  if ((k.bevs != null || k.phevs != null) && k.totalEvs != null) {
+    const comp = (k.bevs || 0) + (k.phevs || 0) + (k.fcevs || 0);
+    if (comp > 0 && k.totalEvs < comp) {
+      console.log("  [reconcile] totalEvs " + k.totalEvs + " < component sum " + comp + " — using component sum");
+      k.totalEvs = comp;
+    }
+  }
+  // Sanity bounds on the ratio; recompute from reconciled totals.
+  const plausibleRatio = (r) => r != null && r >= 5 && r <= 100;
+  if (!plausibleRatio(k.evPerCharger)) k.evPerCharger = null;
+  if (k.evPerCharger == null && k.totalEvs && k.totalChargers) {
+    k.evPerCharger = Math.round(k.totalEvs / k.totalChargers);
+  }
+  return k;
+}
+
 // ------------------------------------------- source 1: Transport Canada
 
 async function fetchTransportCanada() {
@@ -194,12 +224,11 @@ async function fetchTransportCanada() {
 
   const text = html.replace(/<[^>]*>/g, " ");
   const grab = (re) => { const m = text.match(re); return m ? num(m[1]) : null; };
-  // Handles "27 EVs: 1 charger", "27 EVs to 1 charger", "27 EVs per charger"
   const ratioProse =
     text.match(/(\d+)\s*EVs?\s*[:,]?\s*(?:to|per)?\s*(?:every\s*)?1\s*charger/i) ||
     text.match(/(?:ratio of|ratio:?)\s*(\d+)\s*(?:to\s*1|:\s*1|EVs)/i);
 
-  let kpis = {
+  const kpis = {
     totalEvs: grab(/Total EVs?:?\s*([\d,]+)/),
     bevs: grab(/BEVs?:?\s*([\d,]+)/),
     phevs: grab(/PHEVs?:?\s*([\d,]+)/),
@@ -221,13 +250,6 @@ async function fetchTransportCanada() {
         .filter((r) => r.category && r.count != null);
       if (fleet.length) break;
     }
-  }
-  if (fleet) {
-    const sum = (re) => fleet.filter((r) => re.test(r.category)).reduce((a, r) => a + (r.count || 0), 0);
-    const fBev = sum(/bev/i), fPhev = sum(/phev/i), fFcev = sum(/fcev/i);
-    if (kpis.bevs == null && fBev) kpis.bevs = fBev;
-    if (kpis.phevs == null && fPhev) kpis.phevs = fPhev;
-    if (kpis.totalEvs == null && (fBev || fPhev)) kpis.totalEvs = fBev + fPhev + fFcev;
   }
 
   // ---- market share (annual) ----
@@ -274,37 +296,36 @@ async function fetchTransportCanada() {
     if (parsed.length >= 5) { provinces = parsed; break; }
   }
 
-  // ---- KPI fallback chain with sanity bounds ----
-  // Province sums are the most trustworthy national numbers now that roles
-  // are validated arithmetically.
-  let provSums = null;
+  // ---- fill gaps from tables before reconciling ----
+  if (fleet) {
+    const sum = (re) => fleet.filter((r) => re.test(r.category)).reduce((a, r) => a + (r.count || 0), 0);
+    const fBev = sum(/bev/i), fPhev = sum(/phev/i), fFcev = sum(/fcev/i);
+    if (kpis.bevs == null && fBev) kpis.bevs = fBev;
+    if (kpis.phevs == null && fPhev) kpis.phevs = fPhev;
+    if (kpis.fcevs == null) kpis.fcevs = fFcev || null;
+    if (kpis.totalEvs == null && (fBev || fPhev)) kpis.totalEvs = fBev + fPhev + fFcev;
+  }
   if (provinces) {
     const pCh = provinces.reduce((a, p) => a + (p.totalChargers || 0), 0);
     const pEv = provinces.reduce((a, p) => a + (p.totalEvs || 0), 0);
-    if (pCh > 10000 && pEv > 500000) provSums = { chargers: pCh, evs: pEv };
+    if (kpis.totalChargers == null && pCh > 10000) kpis.totalChargers = pCh;
+    if (kpis.totalEvs == null && pEv > 500000) kpis.totalEvs = pEv;
   }
-  const plausibleRatio = (r) => r != null && r >= 5 && r <= 100;
-  if (!plausibleRatio(kpis.evPerCharger)) kpis.evPerCharger = null;
-  if (kpis.totalChargers == null || kpis.totalChargers < 10000) {
-    kpis.totalChargers = (provSums && provSums.chargers) || kpis.totalChargers;
-  }
-  if (kpis.totalEvs == null || kpis.totalEvs < 100000) {
-    kpis.totalEvs = (provSums && provSums.evs) || kpis.totalEvs;
-  }
-  if (kpis.evPerCharger == null && kpis.totalEvs && kpis.totalChargers) {
-    kpis.evPerCharger = Math.round(kpis.totalEvs / kpis.totalChargers);
-  }
-  if (kpis.level2 == null || kpis.level3 == null) {
-    // If charger growth's last row plausibly totals the national count, use it
-    if (chargerGrowth) {
-      const last = chargerGrowth[chargerGrowth.length - 1];
-      const tot = (last.level2 || 0) + (last.level3 || 0);
-      if (tot > 0 && kpis.totalChargers && Math.abs(tot - kpis.totalChargers) / kpis.totalChargers < 0.1) {
-        if (kpis.level2 == null) kpis.level2 = last.level2;
-        if (kpis.level3 == null) kpis.level3 = last.level3;
-      }
+  if ((kpis.level2 == null || kpis.level3 == null) && chargerGrowth) {
+    const last = chargerGrowth[chargerGrowth.length - 1];
+    const tot = (last.level2 || 0) + (last.level3 || 0);
+    if (tot > 0 && kpis.totalChargers && Math.abs(tot - kpis.totalChargers) / kpis.totalChargers < 0.1) {
+      if (kpis.level2 == null) kpis.level2 = last.level2;
+      if (kpis.level3 == null) kpis.level3 = last.level3;
     }
   }
+
+  // ---- reconciliation: arithmetic invariants have the final word ----
+  reconcileKpis(kpis);
+
+  console.log("  [kpis] " + JSON.stringify(kpis));
+  if (provinces) console.log("  [provinces] " + provinces.length + " rows parsed");
+  else console.log("  [provinces] none passed validation");
 
   return { updated, kpis, marketShare, fleet, provinces, chargerGrowth, url: TC_URL };
 }
@@ -319,11 +340,8 @@ const PROV_NAMES = {
 };
 const provName = (s) => PROV_NAMES[String(s || "").toUpperCase().trim()] || String(s || "").trim();
 
-// Aggregation for the ev-charging-units flavor. Per API docs: each row is a
-// charging UNIT; the port-count fields describe the STATION LOCATION and a
-// station may span multiple rows. So: group rows by Station ID, take the max
-// of each count field within the station (they repeat the location total),
-// then sum across stations. Row count and station count both recorded.
+// ev-charging-units flavor: group rows by station (port-count fields repeat
+// the station-level total across unit rows), take max per station, sum.
 function aggregateUnitsCsv(raw) {
   const lines = raw.split("\n");
   if (lines.length < 3) throw new Error("AFDC CSV too short to be data (" + lines.length + " lines)");
@@ -341,7 +359,6 @@ function aggregateUnitsCsv(raw) {
   if (iProv < 0) throw new Error("No province/state column. Headers: " + head.slice(0, 14).join(" | "));
   if (iL2 < 0 && iDC < 0) throw new Error("No charger-level columns. Headers: " + head.slice(0, 14).join(" | "));
 
-  // stationId -> { prov, network, maxL2, maxDC, maxL1, maxKw }
   const stations = new Map();
   let rawRows = 0;
   for (let r = 1; r < lines.length; r++) {
@@ -353,7 +370,7 @@ function aggregateUnitsCsv(raw) {
     if (!prov) continue;
     rawRows++;
     const id = iId >= 0 && f[iId] ? f[iId] : null;
-    const key = id != null ? "id:" + id : "row:" + r; // no ID column → each row its own station
+    const key = id != null ? "id:" + id : "row:" + r;
     let st = stations.get(key);
     if (!st) {
       st = { prov, network: iNet >= 0 ? ((f[iNet] || "Non-networked").trim() || "Non-networked") : null,
@@ -396,7 +413,7 @@ function aggregateUnitsCsv(raw) {
   };
 }
 
-// Aggregation for the All Stations flavor: one row per station; sums are direct.
+// All Stations flavor: one row per station — direct sums.
 function aggregateStationsCsv(raw) {
   const lines = raw.split("\n");
   if (lines.length < 3) throw new Error("AFDC CSV too short to be data (" + lines.length + " lines)");
@@ -473,7 +490,6 @@ async function fetchAfdc() {
   const tmpFile = path.join(os.tmpdir(), "afdc-units.csv");
   const errs = [];
 
-  // Primary: ev-charging-units.csv (per-unit rows, includes kW power output)
   try {
     const unitsUrl = () =>
       AFDC_HOST + "/api/alt-fuel-stations/v1/ev-charging-units.csv?access=public&api_key=" + enc(AFDC_API_KEY) +
@@ -489,7 +505,6 @@ async function fetchAfdc() {
     console.log("  units endpoint failed — " + e.message);
   }
 
-  // Fallback: All Stations v1.csv (one row per station — direct sums)
   try {
     const allUrl = () =>
       AFDC_HOST + "/api/alt-fuel-stations/v1.csv?access=public&api_key=" + enc(AFDC_API_KEY) +
@@ -576,7 +591,6 @@ async function main() {
   const stats = rebuildDataJs();
   if (stats) console.log("data.js rebuilt - " + stats.snapshots + " snapshot(s)");
 
-  // Post-run sanity report
   const k = snapshot.kpis;
   if (k.totalEvs && k.totalChargers) {
     console.log("Sanity: " + k.totalEvs + " EVs / " + k.totalChargers + " chargers = " +
