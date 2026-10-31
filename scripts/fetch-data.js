@@ -373,11 +373,13 @@ async function fetchStatcanViaWds() {
   const seriesByFuel = {};
   for (const [label, fuelIdx] of wanted) {
     if (fuelIdx < 0) continue;
-    const resp = await wdsPost("/getDataFromCubePidCoordAndLatestNPeriods", {
-      id: 20100025,
-      coordinates: [buildCoord(fuelIdx)],
-      nRecentPeriods: 44,
-    });
+    const resp = await wdsPost("/getDataFromCubePidCoordAndLatestNPeriods", [
+      {
+        id: String(20100025),
+        coordinates: [buildCoord(fuelIdx)],
+        nRecentPeriods: 44,
+      },
+    ]);
     const obj = Array.isArray(resp) && resp[0] && resp[0].status === "SUCCESS" ? resp[0].object : null;
     const points = obj && obj.vectorDataPoint;
     if (!points || !points.length) throw new Error("WDS: no data points for " + label);
