@@ -1,24 +1,24 @@
 // ============================================================================
-// scripts/fetch-data.js — v12.1
+// scripts/fetch-data.js — v12.2
 //
-// v12.1 fix (user-reported):
-//   Dashboard showed "2,017 public chargers" while L2 (30,741) + DC fast
-//   (8,479) summed to 39,220. The prose regex for "Total chargers" had
-//   grabbed a stray year (2017). The province-sum fallback never fired
-//   because the province table yielded <5 validated rows this run.
+// v12.2 fix (user-reported: all province charts blank):
+//   Inspected the live TC page. The province table is TWO columns —
+//   "Province/territory" and "Charger data" — where Charger data is a
+//   single text blob containing LABELED numbers:
+//     "EVs per public charger: 36  Total public chargers: 13,081
+//      Total EV count: 473,385"
+//   v12/v12.1's permutation validator saw only 1-2 numbers per row, failed
+//   validation, and dropped every row → provinces = null → 3 blank charts.
 //
-//   FIX: post-parse RECONCILIATION with arithmetic invariants, so no single
-//   bad grab survives:
-//     • If level2 & level3 both exist → totalChargers := level2 + level3
-//       whenever they disagree by >15% (components win).
-//     • If bevs/phevs exist → totalEvs := bevs + phevs + fcev whenever
-//       totalEvs is missing or smaller than the component sum.
-//     • Ratio recomputed last, from reconciled totals.
-//   Plus: the fully parsed KPI set is printed to the run log for debugging.
+//   FIX: primary parser extracts by LABEL within the text blob (immune to
+//   column shuffling); permutation validator kept only as fallback for the
+//   case where TC returns to plain numeric columns. The funding table
+//   ("selected for funding or financing") is skipped because its rows lack
+//   the "Total public chargers" / "Total EV count" labels.
 //
-// v12 recap: permutation-validated TC province rows (ratio×chargers≈EVs),
-// AFDC ev-charging-units rows grouped by station (docs: port-count fields
-// repeat the station total across unit rows), KPI sanity bounds.
+// v12.1 recap: KPI reconciliation invariants (components beat bad totals —
+// killed the stray "2017" grab; ratio recomputed last, bounded 5-100).
+// v12 recap: AFDC units-CSV rows grouped by station before summing.
 // ============================================================================
 
 "use strict";
@@ -155,9 +155,8 @@ function parseCsvLine(line) {
   return cells;
 }
 
-// Assign 3 unknown numbers to (ratio, chargers, evs) by internal consistency:
-// the right assignment satisfies ratio * chargers ~= evs (within 15%) and
-// evs > chargers. Returns null if no assignment fits.
+// Fallback only: assign 3 unlabeled numbers to (ratio, chargers, evs) by
+// internal consistency (ratio * chargers ~= evs, evs > chargers).
 function assignProvinceNumbers(nums) {
   if (!nums || nums.length < 2) return null;
   if (nums.length === 2) {
@@ -187,7 +186,6 @@ function assignProvinceNumbers(nums) {
 // Enforce arithmetic invariants across the KPI set so no single bad grab
 // survives. Mutates and returns the kpis object.
 function reconcileKpis(k) {
-  // Charger family: components beat the total when they disagree badly.
   if (k.level2 != null && k.level3 != null) {
     const sum = k.level2 + k.level3;
     if (k.totalChargers == null || Math.abs(k.totalChargers - sum) / sum > 0.15) {
@@ -198,7 +196,6 @@ function reconcileKpis(k) {
       k.totalChargers = sum;
     }
   }
-  // EV family: total can never be less than its components.
   if ((k.bevs != null || k.phevs != null) && k.totalEvs != null) {
     const comp = (k.bevs || 0) + (k.phevs || 0) + (k.fcevs || 0);
     if (comp > 0 && k.totalEvs < comp) {
@@ -206,7 +203,6 @@ function reconcileKpis(k) {
       k.totalEvs = comp;
     }
   }
-  // Sanity bounds on the ratio; recompute from reconciled totals.
   const plausibleRatio = (r) => r != null && r >= 5 && r <= 100;
   if (!plausibleRatio(k.evPerCharger)) k.evPerCharger = null;
   if (k.evPerCharger == null && k.totalEvs && k.totalChargers) {
@@ -279,16 +275,40 @@ async function fetchTransportCanada() {
     }
   }
 
-  // ---- province table: role discovery by permutation validation ----
+  // ---- province table ----
+  // CURRENT FORMAT (verified against live page): two columns —
+  //   "Province/territory" | "Charger data"
+  // where Charger data is a text blob with labeled values:
+  //   "EVs per public charger: 36  Total public chargers: 13,081  Total EV count: 473,385"
+  // PRIMARY: extract by label (column-order immune).
+  // FALLBACK: permutation validation for plain numeric columns.
+  // Note: a second province-keyed table on the page ("Total EV chargers
+  // selected for funding or financing: Open/Planned") is excluded because its
+  // rows never carry the "Total public chargers"/"Total EV count" labels.
   let provinces = null;
   for (const t of tables) {
     const h = header(t);
-    if (!(h.some((c) => /province|jurisdiction|territor/.test(c)))) continue;
     const iProv = h.findIndex((c) => /province|jurisdiction|territor/.test(c));
+    if (iProv < 0) continue;
     const parsed = [];
     for (const r of t.slice(1)) {
       const name = cellText(r[iProv] || "");
-      if (!name || /canada/i.test(name) || /total/i.test(name)) continue;
+      if (!name || /canada/i.test(name) || /^total$/i.test(name)) continue;
+      const blob = r.slice(iProv + 1).join(" ");
+      const mRatio = blob.match(/EVs? per public charger:?\s*([\d,]+)/i);
+      const mCh = blob.match(/Total public chargers?:\s*([\d,]+)/i);
+      const mEv = blob.match(/Total EVs? count:?\s*([\d,]+)/i);
+      if (mCh || mEv) {
+        const ratio = mRatio ? num(mRatio[1]) : null;
+        parsed.push({
+          province: name,
+          evPerCharger: ratio && ratio > 0 ? ratio : null,
+          totalChargers: mCh ? num(mCh[1]) : null,
+          totalEvs: mEv ? num(mEv[1]) : null,
+        });
+        continue;
+      }
+      // fallback: unlabeled numeric columns → permutation validation
       const nums = r.slice(iProv + 1).map(num).filter((v) => v != null && v > 0);
       const a = assignProvinceNumbers(nums);
       if (a) parsed.push({ province: name, ...a });
@@ -324,7 +344,8 @@ async function fetchTransportCanada() {
   reconcileKpis(kpis);
 
   console.log("  [kpis] " + JSON.stringify(kpis));
-  if (provinces) console.log("  [provinces] " + provinces.length + " rows parsed");
+  if (provinces) console.log("  [provinces] " + provinces.length + " rows: " +
+    provinces.map((p) => p.province + " (" + p.totalEvs + " EVs)").join(", "));
   else console.log("  [provinces] none passed validation");
 
   return { updated, kpis, marketShare, fleet, provinces, chargerGrowth, url: TC_URL };
