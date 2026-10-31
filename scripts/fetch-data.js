@@ -1,22 +1,24 @@
 // ============================================================================
-// scripts/fetch-data.js — v11.2
+// scripts/fetch-data.js — v12
 //
-// TEST BUILD: uses the shared DEMO_KEY for AFDC instead of a personal key.
+// v12 fixes (user-reported):
+//   1. TC province table: numbers were landing in wrong columns (QC showed
+//      "36 EVs" — that was the 36:1 ratio). Now roles are discovered by
+//      PERMUTATION VALIDATION: for each row, try every assignment of the
+//      numbers to (ratio, chargers, evs) and keep the one where
+//      ratio x chargers ~= evs and evs > chargers. Column order no longer
+//      matters.
+//   2. National KPIs: chained fallbacks with sanity bounds — prose parse,
+//      then table-derived, then province sums. evPerCharger outside 5-100
+//      is rejected (kills the 534:1 artifact).
+//   3. AFDC ev-charging-units: per the API docs, each row is a charging
+//      UNIT but the port-count fields ("EV Level2 EVSE Num", etc.) describe
+//      the STATION LOCATION, which can span multiple rows. Rows are now
+//      grouped by Station ID, taking the max per count field per station,
+//      then summed across stations. Station count, row count, and the
+//      raw header line are stored in the snapshot for transparency.
 //
-//   DEMO_KEY is documented for exploring the API before signing up:
-//     30 requests/hour and 50/day, per IP address.
-//   A monthly run makes ~3 requests, so it fits — BUT GitHub Actions
-//   runners share IP pools, so other users can exhaust the quota and you
-//   may see HTTP 429. That's the shared key, not the code.
-//
-//   When you have your own key from developer.nlr.gov/signup, replace
-//   DEMO_KEY below (or set the AFDC_API_KEY repository secret).
-//
-// Sources:
-//   • Transport Canada (HTML tables) — EV/charger KPIs, provinces, trends
-//   • US DOE AFDC ev-charging-units.csv — per-port data incl. kW
-//       ↳ falls back to All Stations v1.csv
-//       ↳ also calls /last-updated for a freshness stamp
+// Key: DEMO_KEY (swap for your own from developer.nlr.gov/signup).
 // ============================================================================
 
 "use strict";
@@ -34,11 +36,7 @@ const TC_URL =
   "https://tc.canada.ca/en/road-transportation/innovative-technologies/" +
   "electric-vehicles/canada-electric-vehicle-dashboard";
 const AFDC_HOST = "https://developer.nlr.gov";
-
-// >>> SWAP THIS LINE when you have your own key <<<
 const AFDC_API_KEY = process.env.AFDC_API_KEY || "DEMO_KEY";
-// previous key (returned 403 API_KEY_UNAUTHORIZED):
-// "ZCWrO9fKZWtFzxsMrqfGlCcBnCx1ibQSqvJfhA1y"
 
 const UA = "CanadaEVDashboard/1.0 (GitHub Actions; personal use)";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -67,10 +65,7 @@ async function httpGet(url, { asBuffer = false, timeoutMs = 120000, retries = 2 
   throw lastErr;
 }
 
-// Download to file via fetch, then curl. curl worst case (2 retries x 180s)
-// sits inside the 600s parent timeout. Self-describing errors on failure.
 async function downloadToFile(url, tmpFile, { timeoutMs = 180000 } = {}) {
-  // 1) Node fetch
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -85,7 +80,6 @@ async function downloadToFile(url, tmpFile, { timeoutMs = 180000 } = {}) {
   } catch (fetchErr) {
     console.log("  fetch failed (" + fetchErr.message + ") — trying curl");
   }
-  // 2) curl fallback
   try {
     const codeOut = execFileSync(
       "curl",
@@ -161,6 +155,36 @@ function parseCsvLine(line) {
   return cells;
 }
 
+// Assign 3 unknown numbers to (ratio, chargers, evs) by internal consistency:
+// the right assignment satisfies ratio * chargers ~= evs (within 15%) and
+// evs > chargers. Returns null if no assignment fits.
+function assignProvinceNumbers(nums) {
+  if (!nums || nums.length < 2) return null;
+  if (nums.length === 2) {
+    const [a, b] = nums;
+    // two numbers: they must be chargers & evs (evs larger)
+    if (a > b && b > 0) return { evPerCharger: null, totalChargers: b, totalEvs: a };
+    if (b > a && a > 0) return { evPerCharger: null, totalChargers: a, totalEvs: b };
+    return null;
+  }
+  let best = null, bestScore = Infinity;
+  for (let i = 0; i < 3; i++) {
+    const rest = [0, 1, 2].filter((j) => j !== i);
+    const r = nums[i]; // candidate ratio
+    for (const [ci, ei] of [rest, [rest[1], rest[0]]]) {
+      const chargers = nums[ci], evs = nums[ei];
+      if (!(evs > chargers) || chargers <= 0 || r <= 0) continue;
+      const expected = r * chargers;
+      const dev = Math.abs(evs - expected) / expected;
+      if (dev <= 0.15 && dev < bestScore) {
+        bestScore = dev;
+        best = { evPerCharger: r, totalChargers: chargers, totalEvs: evs };
+      }
+    }
+  }
+  return best;
+}
+
 // ------------------------------------------- source 1: Transport Canada
 
 async function fetchTransportCanada() {
@@ -170,38 +194,31 @@ async function fetchTransportCanada() {
 
   const text = html.replace(/<[^>]*>/g, " ");
   const grab = (re) => { const m = text.match(re); return m ? num(m[1]) : null; };
-  const ratio = text.match(/(\d+)\s*EVs?\s*(?:to|per)\s*(?:every\s*)?1\s*charger/i);
+  // Handles "27 EVs: 1 charger", "27 EVs to 1 charger", "27 EVs per charger"
+  const ratioProse =
+    text.match(/(\d+)\s*EVs?\s*[:,]?\s*(?:to|per)?\s*(?:every\s*)?1\s*charger/i) ||
+    text.match(/(?:ratio of|ratio:?)\s*(\d+)\s*(?:to\s*1|:\s*1|EVs)/i);
 
-  const kpis = {
+  let kpis = {
     totalEvs: grab(/Total EVs?:?\s*([\d,]+)/),
     bevs: grab(/BEVs?:?\s*([\d,]+)/),
     phevs: grab(/PHEVs?:?\s*([\d,]+)/),
     totalChargers: grab(/Total chargers:?\s*([\d,]+)/),
     level2: grab(/Level 2:?\s*([\d,]+)/),
     level3: grab(/Level 3:?\s*([\d,]+)/),
-    evPerCharger: ratio ? parseInt(ratio[1], 10) : null,
+    evPerCharger: ratioProse ? parseInt(ratioProse[1], 10) : null,
   };
 
   const tables = parseTables(html);
   const header = (t) => t[0].map((c) => String(c || "").toLowerCase());
-  const hasHeader = (t, ...words) => words.every((w) => header(t).some((c) => c.includes(w)));
 
-  let marketShare = null;
-  for (const t of tables) {
-    const h = header(t);
-    if (h.includes("year") && (h.includes("bev") || h.includes("zev"))) {
-      marketShare = t.slice(1).map((r) => ({
-        period: r[0], bev: pct(r[1]), phev: pct(r[2]), fcev: pct(r[3]), total: pct(r[4]),
-      })).filter((x) => x.total != null);
-      break;
-    }
-  }
-
+  // ---- fleet table (categories) ----
   let fleet = null;
   for (const t of tables) {
-    if (hasHeader(t, "vehicle category") || hasHeader(t, "category")) {
-      const rows = t.slice(1).map((r) => ({ category: r[0], count: num(r[1]), sharePct: pct(r[2]) }));
-      fleet = rows.filter((r) => r.category && r.count != null);
+    const h = header(t);
+    if (h.some((c) => /categor/.test(c))) {
+      fleet = t.slice(1).map((r) => ({ category: r[0], count: num(r[1]), sharePct: pct(r[2]) }))
+        .filter((r) => r.category && r.count != null);
       if (fleet.length) break;
     }
   }
@@ -213,6 +230,19 @@ async function fetchTransportCanada() {
     if (kpis.totalEvs == null && (fBev || fPhev)) kpis.totalEvs = fBev + fPhev + fFcev;
   }
 
+  // ---- market share (annual) ----
+  let marketShare = null;
+  for (const t of tables) {
+    const h = header(t);
+    if (h.includes("year") && (h.includes("bev") || h.includes("zev"))) {
+      marketShare = t.slice(1).map((r) => ({
+        period: r[0], bev: pct(r[1]), phev: pct(r[2]), fcev: pct(r[3]), total: pct(r[4]),
+      })).filter((x) => x.total != null);
+      break;
+    }
+  }
+
+  // ---- charger growth series (chart only — not used for KPIs) ----
   let chargerGrowth = null;
   for (const t of tables) {
     const h = header(t);
@@ -226,35 +256,53 @@ async function fetchTransportCanada() {
       if (chargerGrowth.length > 1) break;
     }
   }
-  if (chargerGrowth) {
-    const last = chargerGrowth[chargerGrowth.length - 1];
-    if (kpis.level2 == null && last.level2 != null) kpis.level2 = last.level2;
-    if (kpis.level3 == null && last.level3 != null) kpis.level3 = last.level3;
+
+  // ---- province table: role discovery by permutation validation ----
+  let provinces = null;
+  for (const t of tables) {
+    const h = header(t);
+    if (!(h.some((c) => /province|jurisdiction|territor/.test(c)))) continue;
+    const iProv = h.findIndex((c) => /province|jurisdiction|territor/.test(c));
+    const parsed = [];
+    for (const r of t.slice(1)) {
+      const name = cellText(r[iProv] || "");
+      if (!name || /canada/i.test(name) || /total/i.test(name)) continue;
+      const nums = r.slice(iProv + 1).map(num).filter((v) => v != null && v > 0);
+      const a = assignProvinceNumbers(nums);
+      if (a) parsed.push({ province: name, ...a });
+    }
+    if (parsed.length >= 5) { provinces = parsed; break; }
   }
-  if (kpis.totalChargers == null && kpis.level2 != null && kpis.level3 != null) {
-    kpis.totalChargers = kpis.level2 + kpis.level3;
+
+  // ---- KPI fallback chain with sanity bounds ----
+  // Province sums are the most trustworthy national numbers now that roles
+  // are validated arithmetically.
+  let provSums = null;
+  if (provinces) {
+    const pCh = provinces.reduce((a, p) => a + (p.totalChargers || 0), 0);
+    const pEv = provinces.reduce((a, p) => a + (p.totalEvs || 0), 0);
+    if (pCh > 10000 && pEv > 500000) provSums = { chargers: pCh, evs: pEv };
+  }
+  const plausibleRatio = (r) => r != null && r >= 5 && r <= 100;
+  if (!plausibleRatio(kpis.evPerCharger)) kpis.evPerCharger = null;
+  if (kpis.totalChargers == null || kpis.totalChargers < 10000) {
+    kpis.totalChargers = (provSums && provSums.chargers) || kpis.totalChargers;
+  }
+  if (kpis.totalEvs == null || kpis.totalEvs < 100000) {
+    kpis.totalEvs = (provSums && provSums.evs) || kpis.totalEvs;
   }
   if (kpis.evPerCharger == null && kpis.totalEvs && kpis.totalChargers) {
     kpis.evPerCharger = Math.round(kpis.totalEvs / kpis.totalChargers);
   }
-
-  let provinces = null;
-  for (const t of tables) {
-    const h = header(t);
-    if (h.some((c) => /province|jurisdiction/.test(c)) && h.some((c) => /charger/.test(c))) {
-      const iProv = h.findIndex((c) => /province|jurisdiction/.test(c));
-      provinces = t.slice(1).map((r) => {
-        const rest = r.slice(iProv + 1);
-        const nums = rest.map(num).filter((v) => v != null);
-        const ratioM = (rest.find((c) => /per/.test(c)) || "").match(/(\d+)\s*EVs?\s*per/i);
-        return {
-          province: cellText(r[iProv]),
-          evPerCharger: ratioM ? parseInt(ratioM[1], 10) : null,
-          totalChargers: nums.length ? nums[nums.length - 2] : null,
-          totalEvs: nums.length ? nums[nums.length - 1] : null,
-        };
-      }).filter((p) => p.province && !/canada/i.test(p.province));
-      if (provinces.length >= 5) break;
+  if (kpis.level2 == null || kpis.level3 == null) {
+    // If charger growth's last row plausibly totals the national count, use it
+    if (chargerGrowth) {
+      const last = chargerGrowth[chargerGrowth.length - 1];
+      const tot = (last.level2 || 0) + (last.level3 || 0);
+      if (tot > 0 && kpis.totalChargers && Math.abs(tot - kpis.totalChargers) / kpis.totalChargers < 0.1) {
+        if (kpis.level2 == null) kpis.level2 = last.level2;
+        if (kpis.level3 == null) kpis.level3 = last.level3;
+      }
     }
   }
 
@@ -271,34 +319,31 @@ const PROV_NAMES = {
 };
 const provName = (s) => PROV_NAMES[String(s || "").toUpperCase().trim()] || String(s || "").trim();
 
-function isJsonishOrEmpty(raw) {
-  const head = raw.substring(0, 200);
-  return /total_results|error|\{"|<!DOCTYPE/i.test(head);
-}
-
-// Shared aggregation over either AFDC CSV flavor (per-port or per-station)
-function aggregateAfdcCsv(raw, flavor) {
+// Aggregation for the ev-charging-units flavor. Per API docs: each row is a
+// charging UNIT; the port-count fields describe the STATION LOCATION and a
+// station may span multiple rows. So: group rows by Station ID, take the max
+// of each count field within the station (they repeat the location total),
+// then sum across stations. Row count and station count both recorded.
+function aggregateUnitsCsv(raw) {
   const lines = raw.split("\n");
   if (lines.length < 3) throw new Error("AFDC CSV too short to be data (" + lines.length + " lines)");
-  if (isJsonishOrEmpty(raw)) {
-    throw new Error("AFDC returned an error payload instead of CSV: " + raw.substring(0, 150).replace(/\s+/g, " "));
-  }
-  const head = lines[0].replace(/^\uFEFF/, "").split(",").map((h) => h.trim());
+  const firstLine = lines[0].replace(/^\uFEFF/, "");
+  const head = firstLine.split(",").map((h) => h.trim());
   const lower = head.map((h) => h.toLowerCase());
   const col = (re) => lower.findIndex((h) => re.test(h));
   const iProv = col(/^state$|^province$/);
-  const iL2 = col(/level\s*2.*(evse|num)|evse.*level\s*2/);
-  const iDC = col(/dc\s*fast.*count|ev_dc_fast_num/);
+  const iL2 = col(/level\s*2.*(evse|num|count)|evse.*level\s*2/);
+  const iDC = col(/dc\s*fast.*(count|num)|ev_dc_fast_num/);
+  const iL1 = col(/level\s*1.*(evse|num|count)/);
   const iNet = col(/^ev[_ ]network$/);
-  const iKw = col(/power output/i); // "EV J1772 Power Output (kW)" etc.
-  if (iProv < 0) throw new Error("No province/state column. Headers: " + head.slice(0, 12).join(" | "));
-  if (iL2 < 0 && iDC < 0) throw new Error("No charger-level columns. Headers: " + head.slice(0, 12).join(" | "));
+  const iKw = col(/power output/i);
+  const iId = col(/^id$|^station.*id$|^fuel.*id$/);
+  if (iProv < 0) throw new Error("No province/state column. Headers: " + head.slice(0, 14).join(" | "));
+  if (iL2 < 0 && iDC < 0) throw new Error("No charger-level columns. Headers: " + head.slice(0, 14).join(" | "));
 
-  const byProv = {}, byNetwork = {};
-  let l2Units = 0, dcUnits = 0, totalKw = 0, kwPorts = 0;
-  const seenStationIds = new Set();
-  let locations = 0;
-
+  // stationId -> { prov, network, maxL2, maxDC, maxL1, maxKw }
+  const stations = new Map();
+  let rawRows = 0;
   for (let r = 1; r < lines.length; r++) {
     const line = lines[r];
     if (!line.trim()) continue;
@@ -306,41 +351,42 @@ function aggregateAfdcCsv(raw, flavor) {
     if (f.length < 3) continue;
     const prov = provName(f[iProv]);
     if (!prov) continue;
-    const n2 = iL2 >= 0 ? (parseFloat(f[iL2]) || 0) : 0;
-    const nd = iDC >= 0 ? (parseFloat(f[iDC]) || 0) : 0;
-    const kw = iKw >= 0 ? (parseFloat(f[iKw]) || 0) : 0;
-
-    // Location counting: per-port files repeat station IDs — dedupe them.
-    if (flavor === "units") {
-      const iId = lower.indexOf("id");
-      const id = iId >= 0 && f[iId] ? f[iId] : null;
-      if (id != null) {
-        if (!seenStationIds.has(id)) { seenStationIds.add(id); locations++; }
-      } else locations++;
-    } else {
-      locations++;
+    rawRows++;
+    const id = iId >= 0 && f[iId] ? f[iId] : null;
+    const key = id != null ? "id:" + id : "row:" + r; // no ID column → each row its own station
+    let st = stations.get(key);
+    if (!st) {
+      st = { prov, network: iNet >= 0 ? ((f[iNet] || "Non-networked").trim() || "Non-networked") : null,
+             maxL2: 0, maxDC: 0, maxL1: 0, maxKw: 0 };
+      stations.set(key, st);
     }
-
-    l2Units += n2; dcUnits += nd;
-    if (kw > 0) { totalKw += kw; kwPorts++; }
-    const p = (byProv[prov] = byProv[prov] || { level2: 0, dcFast: 0, kw: 0 });
-    p.level2 += n2; p.dcFast += nd; p.kw += kw;
-    if (iNet >= 0) {
-      const net = (f[iNet] || "Non-networked").trim() || "Non-networked";
-      byNetwork[net] = (byNetwork[net] || 0) + 1;
-    }
+    if (iL2 >= 0) st.maxL2 = Math.max(st.maxL2, parseFloat(f[iL2]) || 0);
+    if (iDC >= 0) st.maxDC = Math.max(st.maxDC, parseFloat(f[iDC]) || 0);
+    if (iL1 >= 0) st.maxL1 = Math.max(st.maxL1, parseFloat(f[iL1]) || 0);
+    if (iKw >= 0) st.maxKw = Math.max(st.maxKw, parseFloat(f[iKw]) || 0);
   }
 
+  const byProv = {}, byNetwork = {};
+  let l2 = 0, dc = 0, l1 = 0, totalKw = 0;
+  for (const st of stations.values()) {
+    l2 += st.maxL2; dc += st.maxDC; l1 += st.maxL1; totalKw += st.maxKw;
+    const p = (byProv[st.prov] = byProv[st.prov] || { level2: 0, dcFast: 0, kw: 0 });
+    p.level2 += st.maxL2; p.dcFast += st.maxDC; p.kw += st.maxKw;
+    if (st.network) byNetwork[st.network] = (byNetwork[st.network] || 0) + 1;
+  }
   if (!Object.keys(byProv).length) throw new Error("AFDC CSV parsed but no Canadian province rows found");
 
   return {
     source: "US DOE Alternative Fuels Data Center (covers Canada)",
-    flavor,
-    totalLocations: locations,
-    level2Units: l2Units,
-    dcFastUnits: dcUnits,
+    flavor: "units",
+    stationCount: stations.size,
+    rawRowCount: rawRows,
+    headerLine: firstLine.substring(0, 400),
+    totalLocations: stations.size,
+    level1Units: Math.round(l1),
+    level2Units: Math.round(l2),
+    dcFastUnits: Math.round(dc),
     totalKw: Math.round(totalKw),
-    kwPortCount: kwPorts,
     byProvince: Object.entries(byProv).map(([province, v]) => ({
       province, level2: Math.round(v.level2), dcFast: Math.round(v.dcFast), kw: Math.round(v.kw),
     })).sort((a, b) => (b.level2 + b.dcFast) - (a.level2 + a.dcFast)),
@@ -350,17 +396,73 @@ function aggregateAfdcCsv(raw, flavor) {
   };
 }
 
-async function fetchAfdcWithRetries(buildUrl, tmpFile, label) {
+// Aggregation for the All Stations flavor: one row per station; sums are direct.
+function aggregateStationsCsv(raw) {
+  const lines = raw.split("\n");
+  if (lines.length < 3) throw new Error("AFDC CSV too short to be data (" + lines.length + " lines)");
+  const firstLine = lines[0].replace(/^\uFEFF/, "");
+  const head = firstLine.split(",").map((h) => h.trim());
+  const lower = head.map((h) => h.toLowerCase());
+  const col = (re) => lower.findIndex((h) => re.test(h));
+  const iProv = col(/^state$|^province$/);
+  const iL2 = col(/level\s*2.*(evse|num|count)|evse.*level\s*2/);
+  const iDC = col(/dc\s*fast.*(count|num)/);
+  const iNet = col(/^ev[_ ]network$/);
+  const iKw = col(/power output/i);
+  if (iProv < 0) throw new Error("No province/state column. Headers: " + head.slice(0, 14).join(" | "));
+
+  const byProv = {}, byNetwork = {};
+  let l2 = 0, dc = 0, totalKw = 0, locations = 0;
+  for (let r = 1; r < lines.length; r++) {
+    const line = lines[r];
+    if (!line.trim()) continue;
+    const f = parseCsvLine(line);
+    if (f.length < 3) continue;
+    const prov = provName(f[iProv]);
+    if (!prov) continue;
+    locations++;
+    const n2 = iL2 >= 0 ? (parseFloat(f[iL2]) || 0) : 0;
+    const nd = iDC >= 0 ? (parseFloat(f[iDC]) || 0) : 0;
+    const kw = iKw >= 0 ? (parseFloat(f[iKw]) || 0) : 0;
+    l2 += n2; dc += nd; totalKw += kw;
+    const p = (byProv[prov] = byProv[prov] || { level2: 0, dcFast: 0, kw: 0 });
+    p.level2 += n2; p.dcFast += nd; p.kw += kw;
+    if (iNet >= 0) {
+      const net = (f[iNet] || "Non-networked").trim() || "Non-networked";
+      byNetwork[net] = (byNetwork[net] || 0) + 1;
+    }
+  }
+  if (!Object.keys(byProv).length) throw new Error("AFDC CSV parsed but no Canadian province rows found");
+
+  return {
+    source: "US DOE Alternative Fuels Data Center (covers Canada)",
+    flavor: "stations",
+    stationCount: locations,
+    rawRowCount: locations,
+    headerLine: firstLine.substring(0, 400),
+    totalLocations: locations,
+    level2Units: Math.round(l2),
+    dcFastUnits: Math.round(dc),
+    totalKw: Math.round(totalKw),
+    byProvince: Object.entries(byProv).map(([province, v]) => ({
+      province, level2: Math.round(v.level2), dcFast: Math.round(v.dcFast), kw: Math.round(v.kw),
+    })).sort((a, b) => (b.level2 + b.dcFast) - (a.level2 + a.dcFast)),
+    topNetworks: Object.entries(byNetwork).sort((a, b) => b[1] - a[1]).slice(0, 10)
+      .map(([network, count]) => ({ network, count })),
+    url: "https://afdc.energy.gov/stations/states",
+  };
+}
+
+async function fetchAfdcWithRetries(buildUrl, tmpFile, aggregator) {
   const dl = await downloadToFile(buildUrl(), tmpFile);
   let raw = fs.readFileSync(tmpFile, "utf8").replace(/^\uFEFF/, "");
-  // One 429 backoff retry (DEMO_KEY shares an IP quota, so this matters)
   if (/429|rate limit|OVER_RATE_LIMIT/i.test(raw.substring(0, 300))) {
     console.log("  rate limited — backing off 60s");
     await sleep(60000);
     await downloadToFile(buildUrl(), tmpFile);
     raw = fs.readFileSync(tmpFile, "utf8").replace(/^\uFEFF/, "");
   }
-  const parsed = aggregateAfdcCsv(raw, label);
+  const parsed = aggregator(raw);
   parsed.downloadedVia = dl.method;
   return parsed;
 }
@@ -371,15 +473,15 @@ async function fetchAfdc() {
   const tmpFile = path.join(os.tmpdir(), "afdc-units.csv");
   const errs = [];
 
-  // Primary: ev-charging-units.csv (per-port, includes kW power output)
+  // Primary: ev-charging-units.csv (per-unit rows, includes kW power output)
   try {
     const unitsUrl = () =>
       AFDC_HOST + "/api/alt-fuel-stations/v1/ev-charging-units.csv?access=public&api_key=" + enc(AFDC_API_KEY) +
       "&cards_accepted=all&country=CA&download=true&ev_charging_level=2%2Cdc_fast" +
       "&ev_connector_type=all&ev_network=all&facility_type=all&fuel_type=ELEC" +
       "&funding_sources=all&limit=all&owner_type=all&state=all&status=E&utf8_bom=true";
-    const r = await fetchAfdcWithRetries(unitsUrl, tmpFile, "units");
-    console.log("  (ev-charging-units via " + r.downloadedVia + ")");
+    const r = await fetchAfdcWithRetries(unitsUrl, tmpFile, aggregateUnitsCsv);
+    console.log("  (ev-charging-units via " + r.downloadedVia + ": " + r.rawRowCount + " rows → " + r.stationCount + " stations)");
     r.lastUpdated = await fetchAfdcLastUpdated();
     return r;
   } catch (e) {
@@ -387,14 +489,14 @@ async function fetchAfdc() {
     console.log("  units endpoint failed — " + e.message);
   }
 
-  // Fallback: All Stations v1.csv
+  // Fallback: All Stations v1.csv (one row per station — direct sums)
   try {
     const allUrl = () =>
       AFDC_HOST + "/api/alt-fuel-stations/v1.csv?access=public&api_key=" + enc(AFDC_API_KEY) +
       "&country=CA&download=true&ev_charging_level=2%2Cdc_fast&fuel_type=ELEC" +
       "&limit=all&status=E&utf8_bom=true";
-    const r = await fetchAfdcWithRetries(allUrl, tmpFile, "stations");
-    console.log("  (all-stations via " + r.downloadedVia + ")");
+    const r = await fetchAfdcWithRetries(allUrl, tmpFile, aggregateStationsCsv);
+    console.log("  (all-stations via " + r.downloadedVia + ": " + r.stationCount + " stations)");
     r.lastUpdated = await fetchAfdcLastUpdated();
     return r;
   } catch (e) {
@@ -473,6 +575,17 @@ async function main() {
   console.log("Saved data/history/" + fname);
   const stats = rebuildDataJs();
   if (stats) console.log("data.js rebuilt - " + stats.snapshots + " snapshot(s)");
+
+  // Post-run sanity report
+  const k = snapshot.kpis;
+  if (k.totalEvs && k.totalChargers) {
+    console.log("Sanity: " + k.totalEvs + " EVs / " + k.totalChargers + " chargers = " +
+      (k.totalEvs / k.totalChargers).toFixed(1) + ":1");
+  }
+  if (afdc.totalLocations) {
+    console.log("Sanity: AFDC " + ((afdc.level2Units || 0) + (afdc.dcFastUnits || 0)) +
+      " units across " + afdc.totalLocations + " stations");
+  }
 
   const failures = Object.values(snapshot.sources).filter((s) => !s.ok);
   if (failures.length) console.warn("NOTE: " + failures.length + " source(s) failed; others committed.");
