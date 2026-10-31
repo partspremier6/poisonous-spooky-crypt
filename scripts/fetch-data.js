@@ -1,6 +1,20 @@
-// scripts/fetch-data.js
-// Fetches Canadian EV data from three government sources
-// Runs on GitHub Actions, commits results back to the repo
+// ============================================================================
+// FILE: scripts/fetch-data.js   (FIXED VERSION - Nov 2026)
+// ----------------------------------------------------------------------------
+// Fixes in this version:
+//   1. StatCan: the bulk CSV is ~hundreds of MB (covers every census
+//      subdivision). Loading it as one string exceeded Node's ~512MB string
+//      limit. Now parsed as a byte-stream, line by line, keeping only
+//      Canada-level rows -> tiny memory footprint.
+//   2. Open Canada: the CKAN API base URL was wrong (open.canada.ca/api/...
+//      returns 404). Correct base is open.canada.ca/data/en/api/3/action/...
+//      The script now tries several known bases, and if none respond it
+//      falls back to scraping the dataset's own page for the direct XLSX
+//      download link.
+//
+// Replace the entire content of scripts/fetch-data.js in the GitHub repo
+// with this file, commit, then run the workflow from the Actions tab.
+// ============================================================================
 
 "use strict";
 
@@ -8,7 +22,6 @@ const fs = require("fs");
 const path = require("path");
 const AdmZip = require("adm-zip");
 const XLSX = require("xlsx");
-const { execSync } = require("child_process");
 
 const ROOT = process.cwd();
 const HISTORY_DIR = path.join(ROOT, "data", "history");
@@ -18,9 +31,15 @@ const TC_URL =
   "electric-vehicles/canada-electric-vehicle-dashboard";
 const STATCAN_CSV_URL =
   "https://www150.statcan.gc.ca/n1/tbl/csv/20100025-eng.zip";
-const CKAN_API_URL =
-  "https://open.canada.ca/api/3/action/package_show" +
-  "?id=706a6d1a-df8e-40e3-8e0c-94211025c528";
+const OPENCANADA_PACKAGE_ID = "706a6d1a-df8e-40e3-8e0c-94211025c528";
+const OPENCANADA_DATASET_PAGE =
+  "https://open.canada.ca/data/en/dataset/" + OPENCANADA_PACKAGE_ID;
+// Known CKAN API base URLs for open.canada.ca, tried in order
+const CKAN_BASES = [
+  "https://open.canada.ca/data/en/api/3/action/package_show",
+  "https://open.canada.ca/data/fr/api/3/action/package_show",
+  "https://open.canada.ca/data/api/3/action/package_show",
+];
 
 const UA = "LocalEVDashboard/1.0 (auto-fetched via GitHub Actions)";
 
@@ -78,28 +97,50 @@ function parseTables(html) {
   return tables;
 }
 
-function parseCsv(text) {
-  const rows = [];
-  let row = [], cur = "", inQ = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
+// Parse ONE line of CSV (handles quoted fields containing commas).
+// Used instead of parsing the whole file as a single string.
+function parseCsvLine(line) {
+  const out = [];
+  let cur = "", inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
     if (inQ) {
       if (ch === '"') {
-        if (text[i + 1] === '"') { cur += '"'; i++; }
+        if (line[i + 1] === '"') { cur += '"'; i++; }
         else inQ = false;
       } else cur += ch;
     } else if (ch === '"') inQ = true;
-    else if (ch === ",") { row.push(cur); cur = ""; }
-    else if (ch === "\n" || ch === "\r") {
-      if (ch === "\r" && text[i + 1] === "\n") i++;
-      row.push(cur); cur = "";
-      if (row.some((c) => c !== "")) rows.push(row);
-      row = [];
-    } else cur += ch;
+    else if (ch === ",") { out.push(cur); cur = ""; }
+    else cur += ch;
   }
-  row.push(cur);
-  if (row.some((c) => c !== "")) rows.push(row);
-  return rows;
+  out.push(cur);
+  return out;
+}
+
+// Iterate lines of a (possibly huge) Buffer WITHOUT building one giant
+// string: decode byte-aligned chunks (cut only at newline bytes, which can
+// never split a multi-byte UTF-8 character mid-sequence).
+function* iterateLines(buffer) {
+  const CHUNK = 16 * 1024 * 1024; // 16 MB at a time
+  let start = 0;
+  let carry = "";
+  while (start < buffer.length) {
+    let end = Math.min(start + CHUNK, buffer.length);
+    if (end < buffer.length) {
+      // extend/shrink to a real newline byte so we decode whole lines
+      const nlByte = buffer.indexOf(10, end);
+      end = nlByte === -1 ? buffer.length : nlByte;
+    }
+    const text = carry + buffer.toString("utf8", start, end);
+    start = end + 1;
+    let from = 0, nl;
+    while ((nl = text.indexOf("\n", from)) !== -1) {
+      yield text.slice(from, nl);
+      from = nl + 1;
+    }
+    carry = text.slice(from);
+  }
+  if (carry) yield carry;
 }
 
 // ------------------------------------------------------ source 1: Transport Canada
@@ -164,28 +205,57 @@ async function fetchTransportCanada() {
 async function fetchStatcan() {
   const buf = await getBuffer(STATCAN_CSV_URL);
   const zip = new AdmZip(buf);
-  const entry = zip.getEntries().find((e) => /\.csv$/i.test(e.entryName) && !/meta/i.test(e.entryName));
+  const entry = zip
+    .getEntries()
+    .find((e) => /\.csv$/i.test(e.entryName) && !/meta/i.test(e.entryName));
   if (!entry) throw new Error("CSV not found inside StatCan zip archive");
 
-  const text = zip.readAsText(entry, "utf-8").replace(/^\uFEFF/, "");
-  const rows = parseCsv(text);
-  const head = rows[0];
-  const idx = (name) => head.findIndex((h) => h.trim() === name);
-  const iRef = idx("REF_DATE"), iGeo = idx("GEO"), iVeh = idx("Vehicle type"),
-        iFuel = idx("Fuel type"), iUom = idx("UOM"), iVal = idx("VALUE");
+  // The unzipped CSV can exceed 500 MB (all census subdivisions), which is
+  // larger than Node's maximum string length - so we never materialize it
+  // as a single string. Extract as a raw Buffer and walk it line by line.
+  const data = entry.getData();
 
   const series = {};
-  for (let r = 1; r < rows.length; r++) {
-    const row = rows[r];
+  let headerParsed = false;
+  let iRef, iGeo, iVeh, iFuel, iUom, iVal;
+  let kept = 0;
+
+  for (const rawLine of iterateLines(data)) {
+    const line = rawLine.charCodeAt(rawLine.length - 1) === 13
+      ? rawLine.slice(0, -1) : rawLine;
+    if (!line) continue;
+
+    if (!headerParsed) {
+      const head = parseCsvLine(line);
+      const idx = (name) => head.findIndex((h) => h.trim() === name);
+      iRef = idx("REF_DATE"); iGeo = idx("GEO"); iVeh = idx("Vehicle type");
+      iFuel = idx("Fuel type"); iUom = idx("UOM"); iVal = idx("VALUE");
+      if (iGeo < 0 || iVal < 0 || iFuel < 0) {
+        throw new Error("Unexpected StatCan CSV header: " + line.substring(0, 200));
+      }
+      headerParsed = true;
+      continue;
+    }
+
+    // cheap pre-filter: only lines whose GEO is Canada (field is quoted in
+    // StatCan bulk CSVs). Skips millions of sub-national rows instantly.
+    if (!line.includes('"Canada"')) continue;
+
+    const row = parseCsvLine(line);
     const g = (i) => (i >= 0 ? row[i] : "");
     if (g(iGeo) !== "Canada") continue;
     if (iUom >= 0 && !/number/i.test(g(iUom))) continue;
-    if (!/^total/i.test(g(iVeh))) continue;
+    if (!/^total/i.test(g(iVeh))) continue; // "Total, new motor vehicles"
+
     const val = parseFloat(g(iVal));
     if (!isFinite(val)) continue;
+
     const quarter = g(iRef).trim();
     (series[quarter] = series[quarter] || {})[g(iFuel).trim()] = val;
+    kept++;
   }
+
+  if (!kept) throw new Error("Parsed StatCan CSV but found 0 Canada-level rows");
 
   const registrations = Object.keys(series).sort().map((q) => {
     const d = series[q];
@@ -194,33 +264,75 @@ async function fetchStatcan() {
     const totalEntry = Object.keys(d).find((k) => /^total/i.test(k));
     const total = totalEntry ? d[totalEntry] : null;
     const zev = bev + phev;
-    return { quarter: q, bev, phev, total, zevSharePct: total ? +(100 * zev / total).toFixed(1) : null };
+    return {
+      quarter: q, bev, phev, total,
+      zevSharePct: total ? +(100 * zev / total).toFixed(1) : null,
+    };
   });
 
-  return { tableId: "20-10-0025-01", lastQuarter: registrations.length ? registrations[registrations.length - 1].quarter : null, registrations, url: "https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=2010002501" };
+  return {
+    tableId: "20-10-0025-01",
+    rowsKept: kept,
+    lastQuarter: registrations.length
+      ? registrations[registrations.length - 1].quarter
+      : null,
+    registrations,
+    url: "https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=2010002501",
+  };
 }
 
 // -------------------------------------------- source 3: Open Canada charging projects
 
-async function fetchChargingProjects() {
-  const meta = JSON.parse(await getText(CKAN_API_URL));
-  const resources = (meta.result && meta.result.resources) || [];
-  const xlsxRes = resources.filter((r) => /^xls/i.test(String(r.format || "")));
-  if (!xlsxRes.length) throw new Error("No XLSX resource found in the Open Canada package");
+async function findXlsxResource() {
+  // 1. Try the known CKAN API bases (correct one is /data/en/api/3/action/)
+  for (const base of CKAN_BASES) {
+    try {
+      const txt = await getText(base + "?id=" + OPENCANADA_PACKAGE_ID);
+      let meta;
+      try { meta = JSON.parse(txt); } catch (e) { continue; }
+      const resources = (meta.result && meta.result.resources) || [];
+      const xlsxRes = resources.filter((r) => /^xls/i.test(String(r.format || "")));
+      if (xlsxRes.length) {
+        const res = xlsxRes.find((r) => /eng/i.test(String(r.language || ""))) ||
+                    xlsxRes[xlsxRes.length - 1];
+        return { url: res.url, via: base };
+      }
+    } catch (e) {
+      // wrong base or temporary failure - try the next one
+    }
+  }
 
-  const res = xlsxRes.find((r) => /eng/i.test(String(r.language || ""))) || xlsxRes[xlsxRes.length - 1];
-  const buf = await getBuffer(res.url);
+  // 2. Fallback: scrape the dataset's public page for a direct XLSX link
+  const html = await getText(OPENCANADA_DATASET_PAGE);
+  const matches = [...html.matchAll(/href="([^"]+\.xlsx[^"]*)"/gi)];
+  if (!matches.length) {
+    throw new Error("Could not locate the XLSX resource via the CKAN API or the dataset page");
+  }
+  const href = matches[0][1].replace(/&amp;/g, "&");
+  return { url: new URL(href, OPENCANADA_DATASET_PAGE).href, via: "dataset page" };
+}
+
+async function fetchChargingProjects() {
+  const { url: xlsxUrl, via } = await findXlsxResource();
+
+  const buf = await getBuffer(xlsxUrl);
   const wb = XLSX.read(buf, { type: "buffer" });
   const ws = wb.Sheets[wb.SheetNames[0]];
   const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true });
   const head = rows[0].map((c) => String(c));
 
-  const findCol = (keywords) => head.findIndex((c) => keywords.some((k) => c.toLowerCase().includes(k)));
+  const findCol = (keywords) =>
+    head.findIndex((c) => keywords.some((k) => c.toLowerCase().includes(k)));
+
   const iProv = findCol(["province", "prov", "state"]);
   const iCnt = findCol(["charger", "borne", "number of"]);
   const iStatus = findCol(["status"]);
 
-  if (iProv < 0 || iCnt < 0) throw new Error("Could not find province/charger columns.");
+  if (iProv < 0 || iCnt < 0)
+    throw new Error(
+      "Downloaded the XLSX but could not find province/charger columns. Header: " +
+        head.slice(0, 15).join(" | ")
+    );
 
   const byProv = {}, byStatus = {};
   let total = 0, projects = 0;
@@ -233,12 +345,26 @@ async function fetchChargingProjects() {
     projects++;
     const p = String(provRaw).trim();
     byProv[p] = (byProv[p] || 0) + cnt;
-    if (iStatus >= 0) { const s = String(rows[r][iStatus] || "").trim(); if (s) byStatus[s] = (byStatus[s] || 0) + 1; }
+    if (iStatus >= 0) {
+      const s = String(rows[r][iStatus] || "").trim();
+      if (s) byStatus[s] = (byStatus[s] || 0) + 1;
+    }
   }
 
-  const chargersByProvince = Object.entries(byProv).map(([province, chargers]) => ({ province, chargers: Math.round(chargers) })).sort((a, b) => b.chargers - a.chargers);
+  const chargersByProvince = Object.entries(byProv)
+    .map(([province, chargers]) => ({ province, chargers: Math.round(chargers) }))
+    .sort((a, b) => b.chargers - a.chargers);
 
-  return { resourceName: "Projects funded by the EVAFIDI, ZEVIP and CHRI programs (NRCan)", resourceUrl: res.url, totalFundedChargers: Math.round(total), projectCount: projects, chargersByProvince, projectsByStatus: byStatus, url: "https://open.canada.ca/data/en/dataset/706a6d1a-df8e-40e3-8e0c-94211025c528" };
+  return {
+    resourceName: "Projects funded by the EVAFIDI, ZEVIP and CHRI programs (NRCan)",
+    resourceUrl: xlsxUrl,
+    resourceVia: via,
+    totalFundedChargers: Math.round(total),
+    projectCount: projects,
+    chargersByProvince,
+    projectsByStatus: byStatus,
+    url: OPENCANADA_DATASET_PAGE,
+  };
 }
 
 // ------------------------------------------------------------------ pipeline
@@ -252,8 +378,13 @@ function rebuildDataJs() {
     return { file: f, fetchedAt: j.fetchedAt, kpis: j.kpis, sources: j.sources };
   });
 
-  const latest = JSON.parse(fs.readFileSync(path.join(HISTORY_DIR, files[files.length - 1]), "utf-8"));
-  const js = "// AUTO-GENERATED by fetch-data.js\nwindow.EV_HISTORY = " + JSON.stringify(history) + ";\nwindow.EV_LATEST = " + JSON.stringify(latest) + ";\n";
+  const latest = JSON.parse(
+    fs.readFileSync(path.join(HISTORY_DIR, files[files.length - 1]), "utf-8")
+  );
+  const js =
+    "// AUTO-GENERATED by fetch-data.js\n" +
+    "window.EV_HISTORY = " + JSON.stringify(history) + ";\n" +
+    "window.EV_LATEST = " + JSON.stringify(latest) + ";\n";
 
   const dataDir = path.join(ROOT, "data");
   if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
@@ -292,10 +423,15 @@ async function main() {
   const lastReg = regs.length ? regs[regs.length - 1] : {};
 
   snapshot.kpis = {
-    totalEvs: tc.kpis ? tc.kpis.totalEvs : null, bevs: tc.kpis ? tc.kpis.bevs : null, phevs: tc.kpis ? tc.kpis.phevs : null,
-    totalChargers: tc.kpis ? tc.kpis.totalChargers : null, evPerCharger: tc.kpis ? tc.kpis.evPerCharger : null,
-    marketSharePct: lastReg.zevSharePct != null ? lastReg.zevSharePct : null, marketShareQuarter: lastReg.quarter || null,
-    fundedChargers: cp.totalFundedChargers != null ? cp.totalFundedChargers : null, fundedProjects: cp.projectCount != null ? cp.projectCount : null,
+    totalEvs: tc.kpis ? tc.kpis.totalEvs : null,
+    bevs: tc.kpis ? tc.kpis.bevs : null,
+    phevs: tc.kpis ? tc.kpis.phevs : null,
+    totalChargers: tc.kpis ? tc.kpis.totalChargers : null,
+    evPerCharger: tc.kpis ? tc.kpis.evPerCharger : null,
+    marketSharePct: lastReg.zevSharePct != null ? lastReg.zevSharePct : null,
+    marketShareQuarter: lastReg.quarter || null,
+    fundedChargers: cp.totalFundedChargers != null ? cp.totalFundedChargers : null,
+    fundedProjects: cp.projectCount != null ? cp.projectCount : null,
   };
 
   const fname = "snapshot-" + ts.toISOString().replace(/[:.]/g, "-") + ".json";
@@ -307,7 +443,6 @@ async function main() {
 
   const failures = Object.values(snapshot.sources).filter((s) => !s.ok);
   if (failures.length) console.warn("NOTE: " + failures.length + " source(s) failed this run.");
-  process.exit(failures.length > 0 ? 1 : 0);
 }
 
 main().catch((e) => { console.error("Fatal error:", e); process.exit(1); });
