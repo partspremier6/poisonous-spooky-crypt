@@ -1,24 +1,23 @@
 // ============================================================================
-// scripts/fetch-data.js — v12.2
+// scripts/fetch-data.js — v12.3
 //
-// v12.2 fix (user-reported: all province charts blank):
-//   Inspected the live TC page. The province table is TWO columns —
-//   "Province/territory" and "Charger data" — where Charger data is a
-//   single text blob containing LABELED numbers:
-//     "EVs per public charger: 36  Total public chargers: 13,081
-//      Total EV count: 473,385"
-//   v12/v12.1's permutation validator saw only 1-2 numbers per row, failed
-//   validation, and dropped every row → provinces = null → 3 blank charts.
+// v12.3 fixes (user-reported):
+//   1. kW was limited to ONE connector type. The AFDC units CSV has a
+//      separate "EV ___ Power Output (kW)" column per connector type
+//      (J1772, J1772COMBO, CHAdeMO, TESLA, NACS, ...). v12.2 grabbed only
+//      the FIRST match — J1772 — so DC fast chargers contributed ~nothing
+//      (hence 75,958 kW national, ~2 kW/unit average). Now ALL columns
+//      matching /power output/i are collected; per station the max of each
+//      connector column is taken, and the station's kW is the SUM across
+//      connector types.
+//   2. Coverage reporting: counts units (rows) and stations that report a
+//      nonzero kW, and exposes kwCoveragePct / unitKwCoveragePct so the
+//      dashboard can say "X% of units report rated power".
 //
-//   FIX: primary parser extracts by LABEL within the text blob (immune to
-//   column shuffling); permutation validator kept only as fallback for the
-//   case where TC returns to plain numeric columns. The funding table
-//   ("selected for funding or financing") is skipped because its rows lack
-//   the "Total public chargers" / "Total EV count" labels.
-//
-// v12.1 recap: KPI reconciliation invariants (components beat bad totals —
-// killed the stray "2017" grab; ratio recomputed last, bounded 5-100).
-// v12 recap: AFDC units-CSV rows grouped by station before summing.
+// v12.2 recap: TC province table parsed by LABEL from the text blob
+//   ("Total public chargers:", "Total EV count:") with permutation fallback.
+// v12.1 recap: KPI reconciliation invariants (L2+L3 beats bad "total" grabs).
+// v12 recap: AFDC units-CSV rows grouped by station before summing counts.
 // ============================================================================
 
 "use strict";
@@ -155,6 +154,13 @@ function parseCsvLine(line) {
   return cells;
 }
 
+// Find EVERY column whose header matches re (not just the first).
+function findAllCols(lower, re) {
+  const out = [];
+  lower.forEach((h, i) => { if (re.test(h)) out.push(i); });
+  return out;
+}
+
 // Fallback only: assign 3 unlabeled numbers to (ratio, chargers, evs) by
 // internal consistency (ratio * chargers ~= evs, evs > chargers).
 function assignProvinceNumbers(nums) {
@@ -282,9 +288,6 @@ async function fetchTransportCanada() {
   //   "EVs per public charger: 36  Total public chargers: 13,081  Total EV count: 473,385"
   // PRIMARY: extract by label (column-order immune).
   // FALLBACK: permutation validation for plain numeric columns.
-  // Note: a second province-keyed table on the page ("Total EV chargers
-  // selected for funding or financing: Open/Planned") is excluded because its
-  // rows never carry the "Total public chargers"/"Total EV count" labels.
   let provinces = null;
   for (const t of tables) {
     const h = header(t);
@@ -308,7 +311,6 @@ async function fetchTransportCanada() {
         });
         continue;
       }
-      // fallback: unlabeled numeric columns → permutation validation
       const nums = r.slice(iProv + 1).map(num).filter((v) => v != null && v > 0);
       const a = assignProvinceNumbers(nums);
       if (a) parsed.push({ province: name, ...a });
@@ -363,6 +365,10 @@ const provName = (s) => PROV_NAMES[String(s || "").toUpperCase().trim()] || Stri
 
 // ev-charging-units flavor: group rows by station (port-count fields repeat
 // the station-level total across unit rows), take max per station, sum.
+// kW: EVERY "Power Output (kW)" column is collected (one per connector type —
+// J1772, J1772COMBO, CHAdeMO, TESLA, NACS, ...). Per station, each
+// connector column contributes its max; the station's kW is the sum across
+// connector types. Coverage (units/stations reporting any kW) is tracked.
 function aggregateUnitsCsv(raw) {
   const lines = raw.split("\n");
   if (lines.length < 3) throw new Error("AFDC CSV too short to be data (" + lines.length + " lines)");
@@ -375,13 +381,13 @@ function aggregateUnitsCsv(raw) {
   const iDC = col(/dc\s*fast.*(count|num)|ev_dc_fast_num/);
   const iL1 = col(/level\s*1.*(evse|num|count)/);
   const iNet = col(/^ev[_ ]network$/);
-  const iKw = col(/power output/i);
   const iId = col(/^id$|^station.*id$|^fuel.*id$/);
+  const kwCols = findAllCols(lower, /power output/i); // ALL connector types
   if (iProv < 0) throw new Error("No province/state column. Headers: " + head.slice(0, 14).join(" | "));
   if (iL2 < 0 && iDC < 0) throw new Error("No charger-level columns. Headers: " + head.slice(0, 14).join(" | "));
 
   const stations = new Map();
-  let rawRows = 0;
+  let rawRows = 0, unitsReportingKw = 0;
   for (let r = 1; r < lines.length; r++) {
     const line = lines[r];
     if (!line.trim()) continue;
@@ -395,21 +401,33 @@ function aggregateUnitsCsv(raw) {
     let st = stations.get(key);
     if (!st) {
       st = { prov, network: iNet >= 0 ? ((f[iNet] || "Non-networked").trim() || "Non-networked") : null,
-             maxL2: 0, maxDC: 0, maxL1: 0, maxKw: 0 };
+             maxL2: 0, maxDC: 0, maxL1: 0, pw: {} };
       stations.set(key, st);
     }
     if (iL2 >= 0) st.maxL2 = Math.max(st.maxL2, parseFloat(f[iL2]) || 0);
     if (iDC >= 0) st.maxDC = Math.max(st.maxDC, parseFloat(f[iDC]) || 0);
     if (iL1 >= 0) st.maxL1 = Math.max(st.maxL1, parseFloat(f[iL1]) || 0);
-    if (iKw >= 0) st.maxKw = Math.max(st.maxKw, parseFloat(f[iKw]) || 0);
+    let rowKw = 0;
+    for (const kc of kwCols) {
+      const v = parseFloat(f[kc]) || 0;
+      if (v > 0) {
+        rowKw += v;
+        st.pw[kc] = Math.max(st.pw[kc] || 0, v);
+      }
+    }
+    if (rowKw > 0) unitsReportingKw++;
   }
 
   const byProv = {}, byNetwork = {};
-  let l2 = 0, dc = 0, l1 = 0, totalKw = 0;
+  let l2 = 0, dc = 0, l1 = 0, totalKw = 0, stationsWithKw = 0;
   for (const st of stations.values()) {
-    l2 += st.maxL2; dc += st.maxDC; l1 += st.maxL1; totalKw += st.maxKw;
+    l2 += st.maxL2; dc += st.maxDC; l1 += st.maxL1;
+    let sKw = 0;
+    for (const v of Object.values(st.pw)) sKw += v;
+    totalKw += sKw;
+    if (sKw > 0) stationsWithKw++;
     const p = (byProv[st.prov] = byProv[st.prov] || { level2: 0, dcFast: 0, kw: 0 });
-    p.level2 += st.maxL2; p.dcFast += st.maxDC; p.kw += st.maxKw;
+    p.level2 += st.maxL2; p.dcFast += st.maxDC; p.kw += sKw;
     if (st.network) byNetwork[st.network] = (byNetwork[st.network] || 0) + 1;
   }
   if (!Object.keys(byProv).length) throw new Error("AFDC CSV parsed but no Canadian province rows found");
@@ -425,6 +443,13 @@ function aggregateUnitsCsv(raw) {
     level2Units: Math.round(l2),
     dcFastUnits: Math.round(dc),
     totalKw: Math.round(totalKw),
+    // kW coverage & scope
+    kwConnectorColumns: kwCols.length,
+    kwColumnNames: kwCols.map((i) => head[i]),
+    unitsReportingKw,
+    unitKwCoveragePct: rawRows ? +(100 * unitsReportingKw / rawRows).toFixed(1) : null,
+    stationsReportingKw: stationsWithKw,
+    kwCoveragePct: stations.size ? +(100 * stationsWithKw / stations.size).toFixed(1) : null,
     byProvince: Object.entries(byProv).map(([province, v]) => ({
       province, level2: Math.round(v.level2), dcFast: Math.round(v.dcFast), kw: Math.round(v.kw),
     })).sort((a, b) => (b.level2 + b.dcFast) - (a.level2 + a.dcFast)),
@@ -435,6 +460,7 @@ function aggregateUnitsCsv(raw) {
 }
 
 // All Stations flavor: one row per station — direct sums.
+// kW: ALL "Power Output (kW)" columns summed per row (all connector types).
 function aggregateStationsCsv(raw) {
   const lines = raw.split("\n");
   if (lines.length < 3) throw new Error("AFDC CSV too short to be data (" + lines.length + " lines)");
@@ -446,11 +472,11 @@ function aggregateStationsCsv(raw) {
   const iL2 = col(/level\s*2.*(evse|num|count)|evse.*level\s*2/);
   const iDC = col(/dc\s*fast.*(count|num)/);
   const iNet = col(/^ev[_ ]network$/);
-  const iKw = col(/power output/i);
+  const kwCols = findAllCols(lower, /power output/i);
   if (iProv < 0) throw new Error("No province/state column. Headers: " + head.slice(0, 14).join(" | "));
 
   const byProv = {}, byNetwork = {};
-  let l2 = 0, dc = 0, totalKw = 0, locations = 0;
+  let l2 = 0, dc = 0, totalKw = 0, locations = 0, locationsWithKw = 0;
   for (let r = 1; r < lines.length; r++) {
     const line = lines[r];
     if (!line.trim()) continue;
@@ -461,10 +487,12 @@ function aggregateStationsCsv(raw) {
     locations++;
     const n2 = iL2 >= 0 ? (parseFloat(f[iL2]) || 0) : 0;
     const nd = iDC >= 0 ? (parseFloat(f[iDC]) || 0) : 0;
-    const kw = iKw >= 0 ? (parseFloat(f[iKw]) || 0) : 0;
-    l2 += n2; dc += nd; totalKw += kw;
+    let rowKw = 0;
+    for (const kc of kwCols) rowKw += parseFloat(f[kc]) || 0;
+    l2 += n2; dc += nd; totalKw += rowKw;
+    if (rowKw > 0) locationsWithKw++;
     const p = (byProv[prov] = byProv[prov] || { level2: 0, dcFast: 0, kw: 0 });
-    p.level2 += n2; p.dcFast += nd; p.kw += kw;
+    p.level2 += n2; p.dcFast += nd; p.kw += rowKw;
     if (iNet >= 0) {
       const net = (f[iNet] || "Non-networked").trim() || "Non-networked";
       byNetwork[net] = (byNetwork[net] || 0) + 1;
@@ -482,6 +510,12 @@ function aggregateStationsCsv(raw) {
     level2Units: Math.round(l2),
     dcFastUnits: Math.round(dc),
     totalKw: Math.round(totalKw),
+    kwConnectorColumns: kwCols.length,
+    kwColumnNames: kwCols.map((i) => head[i]),
+    stationsReportingKw: locationsWithKw,
+    unitsReportingKw: locationsWithKw,
+    kwCoveragePct: locations ? +(100 * locationsWithKw / locations).toFixed(1) : null,
+    unitKwCoveragePct: locations ? +(100 * locationsWithKw / locations).toFixed(1) : null,
     byProvince: Object.entries(byProv).map(([province, v]) => ({
       province, level2: Math.round(v.level2), dcFast: Math.round(v.dcFast), kw: Math.round(v.kw),
     })).sort((a, b) => (b.level2 + b.dcFast) - (a.level2 + a.dcFast)),
@@ -519,6 +553,9 @@ async function fetchAfdc() {
       "&funding_sources=all&limit=all&owner_type=all&state=all&status=E&utf8_bom=true";
     const r = await fetchAfdcWithRetries(unitsUrl, tmpFile, aggregateUnitsCsv);
     console.log("  (ev-charging-units via " + r.downloadedVia + ": " + r.rawRowCount + " rows → " + r.stationCount + " stations)");
+    console.log("  [kW] " + r.kwConnectorColumns + " connector columns: " + r.kwColumnNames.join(" | "));
+    console.log("  [kW] " + r.unitsReportingKw + "/" + r.rawRowCount + " units report kW (" + r.unitKwCoveragePct + "%)" +
+      "; stations: " + r.stationsReportingKw + "/" + r.stationCount + " (" + r.kwCoveragePct + "%)");
     r.lastUpdated = await fetchAfdcLastUpdated();
     return r;
   } catch (e) {
@@ -533,6 +570,8 @@ async function fetchAfdc() {
       "&limit=all&status=E&utf8_bom=true";
     const r = await fetchAfdcWithRetries(allUrl, tmpFile, aggregateStationsCsv);
     console.log("  (all-stations via " + r.downloadedVia + ": " + r.stationCount + " stations)");
+    console.log("  [kW] " + r.kwConnectorColumns + " connector columns: " + r.kwColumnNames.join(" | "));
+    console.log("  [kW] " + r.stationsReportingKw + "/" + r.stationCount + " stations report kW (" + r.kwCoveragePct + "%)");
     r.lastUpdated = await fetchAfdcLastUpdated();
     return r;
   } catch (e) {
@@ -604,6 +643,7 @@ async function main() {
     marketSharePct: ms.total, marketShareQuarter: ms.period,
     afdcLocations: afdc.totalLocations, afdcLevel2: afdc.level2Units,
     afdcDcFast: afdc.dcFastUnits, afdcKw: afdc.totalKw,
+    afdcKwCoveragePct: afdc.kwCoveragePct,
   };
 
   const fname = "snapshot-" + ts.toISOString().replace(/[:.]/g, "-") + ".json";
@@ -620,6 +660,11 @@ async function main() {
   if (afdc.totalLocations) {
     console.log("Sanity: AFDC " + ((afdc.level2Units || 0) + (afdc.dcFastUnits || 0)) +
       " units across " + afdc.totalLocations + " stations");
+  }
+  if (afdc.totalKw) {
+    console.log("Sanity: " + afdc.totalKw + " kW total (" +
+      (afdc.totalKw / Math.max(1, (afdc.level2Units || 0) + (afdc.dcFastUnits || 0))).toFixed(1) +
+      " kW/unit average — expect roughly 8-20; ~2 means kW is undercounted)");
   }
 
   const failures = Object.values(snapshot.sources).filter((s) => !s.ok);
