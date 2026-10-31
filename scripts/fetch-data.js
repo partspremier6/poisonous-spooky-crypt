@@ -1,19 +1,18 @@
 // ============================================================================
-// FILE: scripts/fetch-data.js   (FIXED VERSION - Nov 2026)
+// FILE: scripts/fetch-data.js   (v4 - Nov 2026)
 // ----------------------------------------------------------------------------
-// Fixes in this version:
-//   1. StatCan: the bulk CSV is ~hundreds of MB (covers every census
-//      subdivision). Loading it as one string exceeded Node's ~512MB string
-//      limit. Now parsed as a byte-stream, line by line, keeping only
-//      Canada-level rows -> tiny memory footprint.
-//   2. Open Canada: the CKAN API base URL was wrong (open.canada.ca/api/...
-//      returns 404). Correct base is open.canada.ca/data/en/api/3/action/...
-//      The script now tries several known bases, and if none respond it
-//      falls back to scraping the dataset's own page for the direct XLSX
-//      download link.
+// Big change in this version - StatCan now uses the official Web Data
+// Service (WDS) REST API instead of the giant bulk CSV:
 //
-// Replace the entire content of scripts/fetch-data.js in the GitHub repo
-// with this file, commit, then run the workflow from the Actions tab.
+//   1. POST /getCubeMetadata for product 2010002501 (discovers dimensions)
+//   2. Locate the Geography / Vehicle type / Fuel type dimensions and their
+//      member IDs (Canada, Total vehicles, each fuel type)
+//   3. POST /getDataFromCubePidCoordAndLatestNPeriods for the last N
+//      quarters of each Canada-level series - tiny responses, no bulk file
+//
+// If the WDS API fails for any reason, the script automatically falls back
+// to the v3 CSV-streaming parser, so the source can never come back
+// completely empty.
 // ============================================================================
 
 "use strict";
@@ -29,12 +28,12 @@ const HISTORY_DIR = path.join(ROOT, "data", "history");
 const TC_URL =
   "https://tc.canada.ca/en/road-transportation/innovative-technologies/" +
   "electric-vehicles/canada-electric-vehicle-dashboard";
-const STATCAN_CSV_URL =
-  "https://www150.statcan.gc.ca/n1/tbl/csv/20100025-eng.zip";
+const STATCAN_WDS_BASE = "https://www150.statcan.gc.ca/t1/wds/rest";
+const STATCAN_PRODUCT_ID = 2010002501;
+const STATCAN_CSV_URL = "https://www150.statcan.gc.ca/n1/tbl/csv/20100025-eng.zip";
 const OPENCANADA_PACKAGE_ID = "706a6d1a-df8e-40e3-8e0c-94211025c528";
 const OPENCANADA_DATASET_PAGE =
   "https://open.canada.ca/data/en/dataset/" + OPENCANADA_PACKAGE_ID;
-// Known CKAN API base URLs for open.canada.ca, tried in order
 const CKAN_BASES = [
   "https://open.canada.ca/data/en/api/3/action/package_show",
   "https://open.canada.ca/data/fr/api/3/action/package_show",
@@ -55,6 +54,16 @@ async function getBuffer(url) {
   const res = await fetch(url, { headers: { "User-Agent": UA } });
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
   return Buffer.from(await res.arrayBuffer());
+}
+
+async function wdsPost(endpoint, body) {
+  const res = await fetch(STATCAN_WDS_BASE + endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": UA },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`WDS ${endpoint} HTTP ${res.status}`);
+  return res.json();
 }
 
 function num(v) {
@@ -97,8 +106,6 @@ function parseTables(html) {
   return tables;
 }
 
-// Parse ONE line of CSV (handles quoted fields containing commas).
-// Used instead of parsing the whole file as a single string.
 function parseCsvLine(line) {
   const out = [];
   let cur = "", inQ = false;
@@ -117,17 +124,13 @@ function parseCsvLine(line) {
   return out;
 }
 
-// Iterate lines of a (possibly huge) Buffer WITHOUT building one giant
-// string: decode byte-aligned chunks (cut only at newline bytes, which can
-// never split a multi-byte UTF-8 character mid-sequence).
 function* iterateLines(buffer) {
-  const CHUNK = 16 * 1024 * 1024; // 16 MB at a time
+  const CHUNK = 16 * 1024 * 1024;
   let start = 0;
   let carry = "";
   while (start < buffer.length) {
     let end = Math.min(start + CHUNK, buffer.length);
     if (end < buffer.length) {
-      // extend/shrink to a real newline byte so we decode whole lines
       const nlByte = buffer.indexOf(10, end);
       end = nlByte === -1 ? buffer.length : nlByte;
     }
@@ -200,9 +203,171 @@ async function fetchTransportCanada() {
   return { updated, kpis, marketShare, fleet, imhzev, url: TC_URL };
 }
 
-// ------------------------------------------------------------- source 2: StatCan
+// ------------------------------------------------- source 2: StatCan (WDS API)
 
-async function fetchStatcan() {
+// Flatten a dimension's members (defensive: some cubes nest them)
+function flattenMembers(dim) {
+  const out = [];
+  const walk = (members) => {
+    for (const m of members || []) {
+      out.push(m);
+      if (Array.isArray(m.member) && m.member.length) walk(m.member);
+    }
+  };
+  walk(dim.member);
+  return out;
+}
+
+function memberCoordId(m, fallbackIndex) {
+  return m.memberId != null ? m.memberId
+       : m.memberPosition != null ? m.memberPosition
+       : fallbackIndex + 1;
+}
+
+async function fetchStatcanWds() {
+  // ---- 1. Metadata (as in the user's snippet) ----
+  const metaResult = await wdsPost("/getCubeMetadata", [
+    { productId: STATCAN_PRODUCT_ID },
+  ]);
+  if (!Array.isArray(metaResult) || metaResult[0].status !== "SUCCESS") {
+    throw new Error("WDS metadata request failed: " + JSON.stringify(metaResult).substring(0, 200));
+  }
+  const meta = metaResult[0].object;
+  console.log("  WDS table: " + (meta.cubeTitleEn || "?") +
+              " (" + (meta.nbSeriesCube || "?") + " series)");
+
+  const dims = (meta.dimension || []).filter(
+    (d) => !/ref.?date|\bperiod\b|\btime\b/i.test(d.dimensionNameEn || "")
+  );
+  if (dims.length < 2) {
+    throw new Error("WDS metadata: unexpected dimensions " +
+      (meta.dimension || []).map((d) => d.dimensionNameEn).join(", "));
+  }
+
+  const withMembers = dims.map((d) => ({ dim: d, members: flattenMembers(d) }));
+
+  // ---- 2. Choose the members we want ----
+  const geoHolder = withMembers.find((h) => /geograph/i.test(h.dim.dimensionNameEn));
+  const vehHolder = withMembers.find((h) => /vehicle\s*type/i.test(h.dim.dimensionNameEn));
+  const fuelHolder = withMembers.find((h) => /fuel\s*type/i.test(h.dim.dimensionNameEn));
+
+  if (!geoHolder || !fuelHolder) {
+    throw new Error("WDS metadata: could not find geography/fuel-type dimensions. " +
+      "Dimensions are: " + withMembers.map((h) => h.dim.dimensionNameEn).join(", "));
+  }
+
+  const nameOf = (m) => m.memberNameEn || m.memberNameFr || "";
+
+  // Canada (may be listed as "Canada" or an aggregate like "Total, Canada")
+  const canadaMember = geoHolder.members.find(
+    (m) => /^(total,?\s*)?canada$/i.test(nameOf(m).trim())
+  ) || geoHolder.members.find((m) => /\bcanada\b/i.test(nameOf(m)));
+  if (!canadaMember) throw new Error("WDS: no 'Canada' member in geography dimension");
+
+  // Vehicle type: prefer a "Total ..." member; otherwise the first member
+  let vehMember = null;
+  if (vehHolder) {
+    vehMember = vehHolder.members.find((m) => /^total/i.test(nameOf(m))) ||
+                vehHolder.members[0];
+  }
+
+  // Any remaining dimension (e.g. seasonal adjustment): take a total-like
+  // member, or the first one
+  const chosen = withMembers.map((h) => {
+    if (h === geoHolder) return { holder: h, member: canadaMember };
+    if (vehHolder && h === vehHolder) return { holder: h, member: vehMember };
+    const pick = h.members.find((m) => /^total/i.test(nameOf(m))) || h.members[0];
+    return { holder: h, member: pick };
+  });
+
+  // ---- 3. Request data for each fuel type, Canada-level ----
+  const fuelMembers = fuelHolder.members;
+  const N_PERIODS = 48; // ~12 years of quarters; API returns what exists
+
+  const requests = fuelMembers.map((fm) => ({
+    productId: STATCAN_PRODUCT_ID,
+    coordinateId: chosen.map((c) =>
+      c.holder === fuelHolder ? memberCoordId(fm, fuelMembers.indexOf(fm))
+                              : memberCoordId(c.member, 0)
+    ).join("."),
+    recentNPeriods: N_PERIODS,
+  }));
+
+  let dataResults;
+  try {
+    dataResults = await wdsPost("/getDataFromCubePidCoordAndLatestNPeriods", requests);
+  } catch (e) {
+    // Some cubes reject requests for more periods than exist - retry smaller
+    requests.forEach((r) => (r.recentNPeriods = 20));
+    dataResults = await wdsPost("/getDataFromCubePidCoordAndLatestNPeriods", requests);
+  }
+
+  // ---- 4. Assemble series: quarter -> { fuelName: value } ----
+  const series = {};
+  let okCount = 0;
+  dataResults.forEach((resObj, i) => {
+    const fuelName = nameOf(fuelMembers[i]).trim();
+    if (resObj.status !== "SUCCESS" || !resObj.object) return; // skip failures
+    okCount++;
+    for (const point of resObj.object.vectorDataPoint || []) {
+      const quarter = String(point.refPer || "").trim();
+      const value = parseFloat(point.value);
+      if (!quarter || !isFinite(value)) continue;
+      (series[quarter] = series[quarter] || {})[fuelName] = value;
+    }
+  });
+
+  if (!okCount) {
+    throw new Error("WDS data request returned no successful series. Response: " +
+      JSON.stringify(dataResults).substring(0, 300));
+  }
+
+  // ---- 5. Classify fuels and build registrations ----
+  const fuels = Object.keys(series).flatMap((q) => Object.keys(series[q]));
+  const fuelNames = [...new Set(fuels)];
+  const bevLabel = fuelNames.find((f) => /battery\s*electric/i.test(f));
+  const phevLabel = fuelNames.find((f) => /plug[- ]?in\s*hybrid/i.test(f));
+  const totalFuel = fuelNames.find((f) => /^total/i.test(f));
+
+  if (!bevLabel) {
+    throw new Error("WDS: no battery-electric fuel type among: " +
+      fuelNames.slice(0, 12).join(" ; "));
+  }
+
+  const registrations = Object.keys(series).sort().map((q) => {
+    const d = series[q];
+    const bev = d[bevLabel] || 0;
+    const phev = (phevLabel && d[phevLabel]) || 0;
+    let total = totalFuel ? d[totalFuel] : null;
+    if (total == null) {
+      // no explicit total fuel member: sum all individual fuels
+      total = Object.entries(d)
+        .filter(([f]) => f !== totalFuel)
+        .reduce((s, [, v]) => s + v, 0);
+    }
+    const zev = bev + phev;
+    return {
+      quarter: q, bev, phev, total,
+      zevSharePct: total ? +(100 * zev / total).toFixed(1) : null,
+    };
+  });
+
+  return {
+    tableId: "20-10-0025-01",
+    via: "WDS API",
+    fuelLabels: { bev: bevLabel, phev: phevLabel, total: totalFuel || "(sum of fuels)" },
+    rowsKept: registrations.length,
+    lastQuarter: registrations.length
+      ? registrations[registrations.length - 1].quarter
+      : null,
+    registrations,
+    url: "https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=2010002501",
+  };
+}
+
+// ------------------------------- source 2 fallback: StatCan bulk CSV (v3 parser)
+
+async function fetchStatcanCsv() {
   const buf = await getBuffer(STATCAN_CSV_URL);
   const zip = new AdmZip(buf);
   const entry = zip
@@ -210,15 +375,10 @@ async function fetchStatcan() {
     .find((e) => /\.csv$/i.test(e.entryName) && !/meta/i.test(e.entryName));
   if (!entry) throw new Error("CSV not found inside StatCan zip archive");
 
-  // The unzipped CSV can exceed 500 MB (all census subdivisions), which is
-  // larger than Node's maximum string length - so we never materialize it
-  // as a single string. Extract as a raw Buffer and walk it line by line.
   const data = entry.getData();
-
-  const series = {};
-  let headerParsed = false;
+  const canadaRows = [];
   let iRef, iGeo, iVeh, iFuel, iUom, iVal;
-  let kept = 0;
+  let headerParsed = false;
 
   for (const rawLine of iterateLines(data)) {
     const line = rawLine.charCodeAt(rawLine.length - 1) === 13
@@ -230,61 +390,81 @@ async function fetchStatcan() {
       const idx = (name) => head.findIndex((h) => h.trim() === name);
       iRef = idx("REF_DATE"); iGeo = idx("GEO"); iVeh = idx("Vehicle type");
       iFuel = idx("Fuel type"); iUom = idx("UOM"); iVal = idx("VALUE");
-      if (iGeo < 0 || iVal < 0 || iFuel < 0) {
-        throw new Error("Unexpected StatCan CSV header: " + line.substring(0, 200));
+      if (iGeo < 0 || iVal < 0 || iFuel < 0 || iRef < 0) {
+        throw new Error("Unexpected StatCan CSV header. Columns: " + head.slice(0, 20).join(" | "));
       }
       headerParsed = true;
       continue;
     }
 
-    // cheap pre-filter: only lines whose GEO is Canada (field is quoted in
-    // StatCan bulk CSVs). Skips millions of sub-national rows instantly.
-    if (!line.includes('"Canada"')) continue;
-
+    if (!line.includes("Canada")) continue;
     const row = parseCsvLine(line);
-    const g = (i) => (i >= 0 ? row[i] : "");
-    if (g(iGeo) !== "Canada") continue;
-    if (iUom >= 0 && !/number/i.test(g(iUom))) continue;
-    if (!/^total/i.test(g(iVeh))) continue; // "Total, new motor vehicles"
-
-    const val = parseFloat(g(iVal));
-    if (!isFinite(val)) continue;
-
-    const quarter = g(iRef).trim();
-    (series[quarter] = series[quarter] || {})[g(iFuel).trim()] = val;
-    kept++;
+    if ((row[iGeo] || "").trim() !== "Canada") continue;
+    canadaRows.push(row);
   }
 
-  if (!kept) throw new Error("Parsed StatCan CSV but found 0 Canada-level rows");
+  if (!canadaRows.length) throw new Error("CSV fallback: no rows with GEO='Canada'");
+
+  const vehTypes = [...new Set(canadaRows.map((r) => (r[iVeh] || "").trim()))];
+  const uoms = iUom >= 0 ? [...new Set(canadaRows.map((r) => (r[iUom] || "").trim()))] : [];
+  const vehTotal = vehTypes.find((v) => /^total/i.test(v)) || null;
+  let uomPick = null;
+  if (uoms.length > 1) uomPick = uoms.find((u) => /number|unit|count|vehicle/i.test(u)) || uoms[0];
+  else if (uoms.length === 1) uomPick = uoms[0];
+
+  const series = {};
+  const fuelSeen = new Set();
+  for (const row of canadaRows) {
+    if (vehTotal && (row[iVeh] || "").trim() !== vehTotal) continue;
+    if (iUom >= 0 && uomPick && (row[iUom] || "").trim() !== uomPick) continue;
+    const fuel = (row[iFuel] || "").trim();
+    const val = parseFloat(row[iVal]);
+    if (!isFinite(val)) continue;
+    fuelSeen.add(fuel);
+    (series[(row[iRef] || "").trim()] = series[(row[iRef] || "").trim()] || {})[fuel] = val;
+  }
+
+  const fuels = [...fuelSeen];
+  const bevLabel = fuels.find((f) => /battery\s*electric/i.test(f));
+  const phevLabel = fuels.find((f) => /plug[- ]?in\s*hybrid/i.test(f));
+  const totalFuelLabel = fuels.find((f) => /^total/i.test(f));
+
+  if (!bevLabel) throw new Error("CSV fallback: no battery-electric fuel type. Seen: " + fuels.join(" ; "));
 
   const registrations = Object.keys(series).sort().map((q) => {
     const d = series[q];
-    const bev = d["Battery electric"] || 0;
-    const phev = d["Plug-in hybrid electric"] || 0;
-    const totalEntry = Object.keys(d).find((k) => /^total/i.test(k));
-    const total = totalEntry ? d[totalEntry] : null;
+    const bev = d[bevLabel] || 0;
+    const phev = (phevLabel && d[phevLabel]) || 0;
+    let total = totalFuelLabel && d[totalFuelLabel] != null ? d[totalFuelLabel] : null;
+    if (total == null) total = Object.entries(d).reduce((s, [, v]) => s + v, 0);
     const zev = bev + phev;
-    return {
-      quarter: q, bev, phev, total,
-      zevSharePct: total ? +(100 * zev / total).toFixed(1) : null,
-    };
+    return { quarter: q, bev, phev, total, zevSharePct: total ? +(100 * zev / total).toFixed(1) : null };
   });
 
   return {
     tableId: "20-10-0025-01",
-    rowsKept: kept,
-    lastQuarter: registrations.length
-      ? registrations[registrations.length - 1].quarter
-      : null,
+    via: "bulk CSV fallback",
+    fuelLabels: { bev: bevLabel, phev: phevLabel, total: totalFuelLabel || "(sum of fuels)" },
+    rowsKept: registrations.length,
+    lastQuarter: registrations.length ? registrations[registrations.length - 1].quarter : null,
     registrations,
     url: "https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=2010002501",
   };
 }
 
+async function fetchStatcan() {
+  try {
+    console.log("  trying WDS API ...");
+    return await fetchStatcanWds();
+  } catch (e) {
+    console.warn("  WDS failed (" + e.message + ") - falling back to bulk CSV");
+    return await fetchStatcanCsv();
+  }
+}
+
 // -------------------------------------------- source 3: Open Canada charging projects
 
 async function findXlsxResource() {
-  // 1. Try the known CKAN API bases (correct one is /data/en/api/3/action/)
   for (const base of CKAN_BASES) {
     try {
       const txt = await getText(base + "?id=" + OPENCANADA_PACKAGE_ID);
@@ -297,12 +477,9 @@ async function findXlsxResource() {
                     xlsxRes[xlsxRes.length - 1];
         return { url: res.url, via: base };
       }
-    } catch (e) {
-      // wrong base or temporary failure - try the next one
-    }
+    } catch (e) { /* try next base */ }
   }
 
-  // 2. Fallback: scrape the dataset's public page for a direct XLSX link
   const html = await getText(OPENCANADA_DATASET_PAGE);
   const matches = [...html.matchAll(/href="([^"]+\.xlsx[^"]*)"/gi)];
   if (!matches.length) {
