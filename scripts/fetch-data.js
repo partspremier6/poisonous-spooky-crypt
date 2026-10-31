@@ -1,22 +1,14 @@
 // ============================================================================
-// scripts/fetch-data.js — v7
+// scripts/fetch-data.js — v8
 // Canada EV Dashboard data fetcher (runs on GitHub Actions)
 //
-// Sources:
-//   1. Transport Canada EV dashboard (KPIs, market share, fleet, provinces,
-//      charger growth — prose first, tables as fallback)
-//   2. Statistics Canada 20-10-0025-01 (bulk CSV, streamed + adaptive filter)
-//   3. US DOE AFDC API (NEW) — public EV charging stations across Canada,
-//      with Level 2 / DC fast split, province and operator network.
-//      Requires the AFDC_API_KEY secret in the workflow.
-//   4. Open Canada ZEVIP/EVAFIDI/CHRI funded projects (XLSX, best-effort)
-//
-// v7 changes:
-//   - NEW source: AFDC charging stations (aggregate by province + network)
-//   - StatCan: downloads zip to disk, parses line-by-line from a Buffer
-//     (never builds one giant string — fixes the 0x1fffffe8 crash),
-//     with adaptive filters so "0 Canada rows" can't happen silently
-//   - All failures are recorded per-source with self-diagnosing messages
+// v8 fixes:
+//   - StatCan: strip the UTF-8 BOM from the header line (this was the
+//     "Unexpected StatCan header: ﻿REF_DATE" failure)
+//   - AFDC: use the canonical station-level endpoint (/v1.csv) with a known
+//     column schema, plus a curl fallback when Node's fetch fails to connect
+//   - Open Gov XLSX: scan the first 10 rows for the real header row
+//     (presentation sheets bury headers under titles), broader column matching
 // ============================================================================
 
 "use strict";
@@ -24,6 +16,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { execFileSync } = require("child_process");
 const AdmZip = require("adm-zip");
 const XLSX = require("xlsx");
 
@@ -39,8 +32,8 @@ const STATCAN_CSV_URL =
 const CKAN_API_URL =
   "https://open.canada.ca/data/en/api/3/action/package_show" +
   "?id=706a6d1a-df8e-40e3-8e0c-94211025c528";
-const AFDC_HOST = "https://developer.nrel.gov"; // NOTE: nrel, not "nlr"
-const AFDC_API_KEY = "ZCWrO9fKZWtFzxsMrqfGlCcBnCx1ibQSqvJfhA1y";
+const AFDC_HOST = "https://developer.nrel.gov";
+const AFDC_API_KEY = process.env.AFDC_API_KEY || "";
 
 const UA = "CanadaEVDashboard/1.0 (GitHub Actions; personal use)";
 
@@ -69,6 +62,56 @@ async function httpGet(url, { asBuffer = false, timeoutMs = 120000, retries = 2 
     }
   }
   throw lastErr;
+}
+
+// Robust download: fetch first, then curl as fallback (fetch sometimes fails
+// to CONNECT against certain hosts on GitHub runners — "fetch failed").
+function robustDownload(url, tmpFile, timeoutMs = 300000) {
+  try {
+    const buf = await0 => null; // placeholder, see below
+  } catch (e) {}
+}
+
+async function downloadToFile(url, tmpFile, { timeoutMs = 300000 } = {}) {
+  // 1) Try Node fetch
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    const res = await fetch(url, {
+      headers: { "User-Agent": UA },
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    fs.writeFileSync(tmpFile, buf);
+    return { method: "fetch" };
+  } catch (fetchErr) {
+    console.log(`  fetch failed (${fetchErr.message}), falling back to curl`);
+  }
+  // 2) curl fallback (preinstalled on ubuntu runners)
+  try {
+    execFileSync(
+      "curl",
+      [
+        "-sSL", "--fail",
+        "--retry", "3",
+        "--max-time", String(Math.round(timeoutMs / 1000)),
+        "-A", UA,
+        "-o", tmpFile,
+        url,
+      ],
+      { stdio: ["ignore", "inherit", "inherit"], timeout: timeoutMs + 60000 }
+    );
+    if (!fs.existsSync(tmpFile) || fs.statSync(tmpFile).size === 0) {
+      throw new Error("curl produced an empty file");
+    }
+    return { method: "curl" };
+  } catch (curlErr) {
+    throw new Error(
+      `download failed via both fetch and curl: ${curlErr.message}`
+    );
+  }
 }
 
 function num(v) {
@@ -133,37 +176,34 @@ function parseCsv(text) {
   return rows;
 }
 
-// Parse a large CSV Buffer line-by-line WITHOUT building one giant string
-// (avoids Node's ~512MB string limit). Assumes no embedded newlines inside
-// quoted fields — true for StatCan bulk exports.
+// Stream CSV lines from a Buffer without building one giant string.
 function streamCsvLines(buf, lineCb) {
-  const CHUNK = 1 << 20; // 1MB scan windows
-  let start = 0;
+  const CHUNK = 1 << 20;
+  let pos = 0;
   let leftover = null;
-  for (let pos = 0; pos < buf.length; pos += CHUNK) {
-    const end = Math.min(pos + CHUNK, buf.length);
-    // find last newline in this window
+  let isFirstLine = true;
+  while (pos < buf.length) {
     let nl = -1;
-    for (let i = end - 1; i >= start; i--) { if (buf[i] === 10) { nl = i; break; } }
-    if (nl === -1) continue;
-    const segStart = leftover ? 0 : start - (leftover ? 0 : 0);
-    // prepend any leftover bytes carried from the previous window
-    const slice = buf.slice(leftover && start === 0 ? 0 : start, nl + 1);
+    const end = Math.min(pos + CHUNK, buf.length);
+    for (let i = end - 1; i >= pos; i--) { if (buf[i] === 10) { nl = i; break; } }
+    if (nl === -1) { pos = end; continue; }
+    const slice = buf.slice(pos, nl + 1);
     const piece = leftover ? Buffer.concat([leftover, slice]) : slice;
     const s = piece.toString("utf-8");
     const lines = s.split("\n");
-    // last element is either "" (ended with \n) or a partial line to carry
     const carry = lines.pop();
     for (const ln of lines) {
-      const t = ln.replace(/\r$/, "");
+      let t = ln.replace(/\r$/, "");
+      // FIX (v8): strip UTF-8 BOM from the very first line if present
+      if (isFirstLine) { t = t.replace(/^\uFEFF/, ""); isFirstLine = false; }
       if (t.trim() !== "") lineCb(t);
     }
     leftover = carry && carry.length ? Buffer.from(carry, "utf-8") : null;
-    start = nl + 1;
-    pos = nl; // resume scanning after this newline
+    pos = nl + 1;
   }
   if (leftover && leftover.length) {
-    const t = leftover.toString("utf-8").replace(/\r$/, "");
+    let t = leftover.toString("utf-8").replace(/\r$/, "");
+    if (isFirstLine) t = t.replace(/^\uFEFF/, "");
     if (t.trim() !== "") lineCb(t);
   }
 }
@@ -175,7 +215,6 @@ async function fetchTransportCanada() {
   const updatedMatch = html.match(/[Dd]ata was updated in ([A-Z][a-z]+ \d{4})/);
   const updated = updatedMatch ? updatedMatch[1] : null;
 
-  // --- KPIs: try prose first ---
   const text = cellText(html);
   const grab = (re) => { const m = text.match(re); return m ? num(m[1]) : null; };
   let kpis = {
@@ -194,7 +233,6 @@ async function fetchTransportCanada() {
   const header = (t) => t[0].map((c) => c.toLowerCase());
   const hasHeader = (t, ...words) => words.every((w) => header(t).some((c) => c.includes(w)));
 
-  // --- Market share table ---
   let marketShare = null;
   for (const t of tables) {
     if (hasHeader(t, "year") && hasHeader(t, "bev")) {
@@ -205,7 +243,6 @@ async function fetchTransportCanada() {
     }
   }
 
-  // --- Fleet table (vehicle category / market share) — also KPI fallback ---
   let fleet = null;
   for (const t of tables) {
     if (hasHeader(t, "vehicle category") || hasHeader(t, "category")) {
@@ -215,16 +252,13 @@ async function fetchTransportCanada() {
     }
   }
   if (fleet) {
-    const sum = (re) => fleet
-      .filter((r) => re.test(r.category))
-      .reduce((a, r) => a + (r.count || 0), 0);
+    const sum = (re) => fleet.filter((r) => re.test(r.category)).reduce((a, r) => a + (r.count || 0), 0);
     const fBev = sum(/bev/i), fPhev = sum(/phev/i), fFcev = sum(/fcev/i);
     if (kpis.bevs == null && fBev) kpis.bevs = fBev;
     if (kpis.phevs == null && fPhev) kpis.phevs = fPhev;
     if (kpis.totalEvs == null && (fBev || fPhev)) kpis.totalEvs = fBev + fPhev + fFcev;
   }
 
-  // --- Cumulative charger table by year (growth) — also KPI fallback ---
   let chargerGrowth = null;
   for (const t of tables) {
     const h = header(t);
@@ -233,9 +267,7 @@ async function fetchTransportCanada() {
     const iYr = h.findIndex((c) => /year|period|date/.test(c));
     if (iL2 >= 0 && iL3 >= 0 && iYr >= 0) {
       const g = t.slice(1).map((r) => ({
-        period: String(r[iYr] || ""),
-        level2: num(r[iL2]),
-        level3: num(r[iL3]),
+        period: String(r[iYr] || ""), level2: num(r[iL2]), level3: num(r[iL3]),
       })).filter((x) => x.period && (x.level2 != null || x.level3 != null));
       if (g.length > 1) { chargerGrowth = g; break; }
     }
@@ -252,7 +284,6 @@ async function fetchTransportCanada() {
     kpis.evPerCharger = Math.round(kpis.totalEvs / kpis.totalChargers);
   }
 
-  // --- Province table (province + chargers/EVs) ---
   let provinces = null;
   for (const t of tables) {
     const h = header(t);
@@ -260,7 +291,6 @@ async function fetchTransportCanada() {
       const iProv = h.findIndex((c) => /province|jurisdiction/.test(c));
       const rows = t.slice(1).map((r) => {
         const rest = r.slice(iProv + 1);
-        // cells typically: "13 EVs per public charger", "11,526", "399,563"
         const nums = rest.map(num).filter((v) => v != null);
         const ratioM = (rest.find((c) => /per/.test(c)) || "").match(/(\d+)\s*EVs?\s*per/i);
         return {
@@ -280,36 +310,40 @@ async function fetchTransportCanada() {
 // ------------------------------------------- source 2: Statistics Canada
 
 async function fetchStatcan() {
-  // Download zip to disk, then decompress entry to a Buffer and stream lines.
-  const zipBuf = await httpGet(STATCAN_CSV_URL, { asBuffer: true, timeoutMs: 300000, retries: 3 });
   const tmpZip = path.join(os.tmpdir(), "statcan-20100025.zip");
-  fs.writeFileSync(tmpZip, zipBuf);
+  const dl = await downloadToFile(STATCAN_CSV_URL, tmpZip, { timeoutMs: 300000 });
+  console.log(`  (downloaded via ${dl.method})`);
 
   const zip = new AdmZip(tmpZip);
   const entry = zip.getEntries().find((e) => /\.csv$/i.test(e.entryName) && !/meta/i.test(e.entryName));
   if (!entry) throw new Error("CSV entry not found inside StatCan zip");
+  const csvBuf = entry.getData();
 
-  const csvBuf = entry.getData(); // Buffer (no giant string)
-
-  // First pass: header
   let head = null;
   const idxOf = (name) => head.findIndex((h) => h === name);
   let iRef = -1, iGeo = -1, iVeh = -1, iFuel = -1, iUom = -1, iVal = -1;
 
-  // Collect Canada-level rows adaptively
   const canadaRows = [];
   const seenUom = {}, seenVeh = {};
+  let headerProblem = null;
+
   streamCsvLines(csvBuf, (line) => {
     if (!head) {
       head = parseCsv(line)[0];
       iRef = idxOf("REF_DATE"); iGeo = idxOf("GEO"); iVeh = idxOf("Vehicle type");
       iFuel = idxOf("Fuel type"); iUom = idxOf("UOM"); iVal = idxOf("VALUE");
-      if ([iRef, iGeo, iFuel, iVal].some((i) => i < 0)) {
-        throw new Error("Unexpected StatCan header: " + head.slice(0, 12).join(" | "));
+      if (iRef < 0 || iGeo < 0 || iFuel < 0 || iVal < 0) {
+        // Diagnostic: show what we DID find before failing
+        headerProblem =
+          "Unexpected StatCan header. Looking for REF_DATE/GEO/'Fuel type'/VALUE. " +
+          "Columns found: " + head.slice(0, 15).join(" | ") +
+          " — REF_DATE:" + iRef + " GEO:" + iGeo + " Fuel:" + iFuel + " VALUE:" + iVal;
+        return;
       }
       return;
     }
-    if (!/Canada/.test(line)) return; // cheap pre-filter
+    if (headerProblem) return;
+    if (!/Canada/.test(line)) return;
     const f = parseCsv(line);
     if (f.length <= Math.max(iRef, iGeo, iVal)) return;
     const uom = iUom >= 0 ? f[iUom] : "";
@@ -319,6 +353,8 @@ async function fetchStatcan() {
     canadaRows.push({ ref: f[iRef], fuel: f[iFuel], uom, veh, val: parseFloat(f[iVal]) });
   });
 
+  if (headerProblem) throw new Error(headerProblem);
+
   if (!canadaRows.length) {
     throw new Error(
       "StatCan CSV parsed but no Canada rows found. UOMs seen: " +
@@ -327,7 +363,6 @@ async function fetchStatcan() {
     );
   }
 
-  // Adaptive: prefer "number"-style UOM; prefer "total"-style vehicle type
   const numberUom = Object.keys(seenUom).find((u) => /number/i.test(u));
   const totalVeh = Object.keys(seenVeh).find((v) => /^total/i.test(v)) ||
                    Object.keys(seenVeh).sort((a, b) => a.length - b.length)[0];
@@ -350,10 +385,8 @@ async function fetchStatcan() {
     const bev = bevKey ? d[bevKey] : 0;
     const phev = phevKey ? d[phevKey] : 0;
     const total = totKey ? d[totKey] : null;
-    return {
-      quarter: q, bev, phev, total,
-      zevSharePct: total ? +(100 * (bev + phev) / total).toFixed(1) : null,
-    };
+    return { quarter: q, bev, phev, total,
+      zevSharePct: total ? +(100 * (bev + phev) / total).toFixed(1) : null };
   }).filter((r) => r.bev || r.phev);
 
   if (!registrations.length) {
@@ -371,40 +404,61 @@ async function fetchStatcan() {
   };
 }
 
-// ------------------------------------------- source 3: AFDC charging stations (NEW)
+// ------------------------------------------- source 3: AFDC charging stations
+
+// Map US/Canadian "State" codes & names to readable province names
+const PROV_NAMES = {
+  AB: "Alberta", BC: "British Columbia", MB: "Manitoba", NB: "New Brunswick",
+  NL: "Newfoundland and Labrador", NS: "Nova Scotia", NT: "Northwest Territories",
+  NU: "Nunavut", ON: "Ontario", PE: "Prince Edward Island", QC: "Quebec",
+  SK: "Saskatchewan", YT: "Yukon",
+};
+const provName = (s) => {
+  const t = String(s || "").trim();
+  return PROV_NAMES[t.toUpperCase()] || t;
+};
 
 async function fetchAfdc() {
   if (!AFDC_API_KEY) {
-    throw new Error("AFDC_API_KEY secret not set (repo Settings → Secrets → Actions)");
+    throw new Error("AFDC_API_KEY not set (env var or hardcoded constant)");
   }
-  const url =
-    AFDC_HOST + "/api/alt-fuel-stations/v1/ev-charging-units.csv" +
+  const params =
     "?access=public&api_key=" + encodeURIComponent(AFDC_API_KEY) +
-    "&country=CA&download=true" +
-    "&ev_charging_level=" + encodeURIComponent("2,dc_fast") +
+    "&country=CA&ev_charging_level=" + encodeURIComponent("2,dc_fast") +
     "&ev_connector_type=all&ev_network=all&facility_type=all" +
     "&fuel_type=ELEC&funding_sources=all&limit=all&state=all&status=E" +
     "&utf8_bom=true";
+  const url = AFDC_HOST + "/api/alt-fuel-stations/v1.csv" + params;
 
-  const raw = await httpGet(url, { timeoutMs: 300000, retries: 2 });
-  const text = raw.replace(/^\uFEFF/, "");
+  const tmpCsv = path.join(os.tmpdir(), "afdc-stations.csv");
+  const dl = await downloadToFile(url, tmpCsv, { timeoutMs: 300000 });
+  console.log(`  (downloaded via ${dl.method})`);
+
+  const text = fs.readFileSync(tmpCsv, "utf-8").replace(/^\uFEFF/, "");
   const rows = parseCsv(text);
   if (rows.length < 2) throw new Error("AFDC returned no data rows");
 
   const head = rows[0].map((h) => String(h).trim());
-  const iProv = head.findIndex((h) => /^(state|province)$/i.test(h));
-  const iL2 = head.findIndex((h) => /level\s*2/i.test(h) && /(num|count|units)/i.test(h));
-  const iDC = head.findIndex((h) => /dc.?fast/i.test(h) && /(num|count|units)/i.test(h));
-  const iNet = head.findIndex((h) => /network/i.test(h) && !/code$/i.test(h));
+  const col = (re) => head.findIndex((h) => re.test(h));
+
+  // Canonical station-level schema: "State" holds the province,
+  // "EV Level2 EVSE Num" and "EV DC Fast Count" hold unit counts,
+  // "EV Network" the operator network.
+  const iProv = col(/^state$|^province$/i);
+  const iL2 = col(/level\s*2.*evse|evse.*level\s*2/i);
+  const iDC = col(/dc\s*fast.*count/i);
+  const iNet = col(/^ev network$/i);
   if (iProv < 0 || (iL2 < 0 && iDC < 0)) {
-    throw new Error("Unexpected AFDC columns: " + head.slice(0, 20).join(" | "));
+    throw new Error(
+      "Unexpected AFDC columns: " + head.slice(0, 20).join(" | ")
+    );
   }
 
   const byProv = {}, byNetwork = {};
   let locations = 0, l2Units = 0, dcUnits = 0;
   for (let r = 1; r < rows.length; r++) {
     const f = rows[r];
-    const prov = (f[iProv] || "").trim();
+    const prov = provName(f[iProv]);
     if (!prov) continue;
     locations++;
     const n2 = iL2 >= 0 ? parseInt(f[iL2], 10) || 0 : 0;
@@ -422,6 +476,7 @@ async function fetchAfdc() {
 
   return {
     source: "US DOE Alternative Fuels Data Center (covers Canada)",
+    downloadedVia: dl.method,
     totalLocations: locations,
     level2Units: l2Units,
     dcFastUnits: dcUnits,
@@ -429,8 +484,7 @@ async function fetchAfdc() {
       .map(([province, v]) => ({ province, ...v }))
       .sort((a, b) => b.locations - a.locations),
     topNetworks: Object.entries(byNetwork)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 10)
+      .sort((a, b) => b[1] - a[1]).slice(0, 10)
       .map(([network, count]) => ({ network, count })),
     url: "https://afdc.energy.gov/stations/states",
   };
@@ -448,46 +502,57 @@ async function fetchChargingProjects() {
   const buf = await httpGet(res.url, { asBuffer: true, timeoutMs: 180000 });
   const wb = XLSX.read(buf, { type: "buffer" });
 
+  const findCol = (kws, head) => head.findIndex((c) =>
+    kws.some((k) => new RegExp("\\b" + k, "i").test(String(c))));
+
   let lastErr = "no worksheets with recognizable columns";
   for (const sheetName of wb.SheetNames) {
     const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, raw: true });
     if (!rows.length) continue;
-    const head = rows[0].map((c) => String(c));
-    const findCol = (kws) => head.findIndex((c) =>
-      kws.some((k) => new RegExp("\\b" + k, "i").test(c.toLowerCase())));
-    const iProv = findCol(["province", "territor", "jurisdiction", "region"]);
-    const iCnt = findCol(["charger", "borne", "port", "connector", "unit"]);
-    const iStatus = findCol(["status"]);
-    if (iProv < 0 || iCnt < 0) {
-      lastErr = "sheet '" + sheetName + "' headers: " + head.slice(0, 12).join(" | ");
-      continue;
-    }
-    const byProv = {}, byStatus = {};
-    let total = 0, projects = 0;
-    for (let r = 1; r < rows.length; r++) {
-      const provRaw = rows[r][iProv];
-      if (provRaw == null || String(provRaw).trim() === "") continue;
-      const m = String(rows[r][iCnt]).match(/\d+(\.\d+)?/);
-      const cnt = m ? parseFloat(m[0]) : 0;
-      total += cnt; projects++;
-      const p = String(provRaw).trim();
-      byProv[p] = (byProv[p] || 0) + cnt;
-      if (iStatus >= 0) {
-        const s = String(rows[r][iStatus] || "").trim();
-        if (s) byStatus[s] = (byStatus[s] || 0) + 1;
+
+    // v8: the real header row may not be row 1 — presentation sheets often
+    // have a title above it. Scan the first 10 rows for one that matches.
+    for (let hr = 0; hr < Math.min(10, rows.length); hr++) {
+      const head = (rows[hr] || []).map((c) => String(c));
+      if (!head.some((c) => c && c !== "undefined")) continue;
+
+      const iProv = findCol(["province", "territor", "jurisdiction", "region", "location", "city"], head);
+      const iCnt = findCol(["charger", "borne", "port", "connector", "unit", "station"], head);
+      if (iProv < 0 || iCnt < 0) {
+        lastErr = `sheet '${sheetName}' row ${hr + 1} headers: ` + head.slice(0, 12).join(" | ");
+        continue; // try next candidate header row in this sheet
       }
-    }
-    if (projects) {
-      return {
-        resourceName: "Projects funded by the EVAFIDI, ZEVIP and CHRI programs (NRCan)",
-        totalFundedChargers: Math.round(total),
-        projectCount: projects,
-        chargersByProvince: Object.entries(byProv)
-          .map(([province, chargers]) => ({ province, chargers: Math.round(chargers) }))
-          .sort((a, b) => b.chargers - a.chargers),
-        projectsByStatus: byStatus,
-        url: "https://open.canada.ca/data/en/dataset/706a6d1a-df8e-40e3-8e0c-94211025c528",
-      };
+
+      const iStatus = findCol(["status"], head);
+      const byProv = {}, byStatus = {};
+      let total = 0, projects = 0;
+      for (let r = hr + 1; r < rows.length; r++) {
+        const provRaw = rows[r][iProv];
+        if (provRaw == null || String(provRaw).trim() === "") continue;
+        const m = String(rows[r][iCnt] ?? "").match(/\d+(\.\d+)?/);
+        const cnt = m ? parseFloat(m[0]) : 0;
+        total += cnt; projects++;
+        const p = String(provRaw).trim();
+        byProv[p] = (byProv[p] || 0) + cnt;
+        if (iStatus >= 0) {
+          const s = String(rows[r][iStatus] || "").trim();
+          if (s) byStatus[s] = (byStatus[s] || 0) + 1;
+        }
+      }
+      if (projects) {
+        return {
+          resourceName: "Projects funded by the EVAFIDI, ZEVIP and CHRI programs (NRCan)",
+          headerRowFoundAt: hr + 1,
+          totalFundedChargers: Math.round(total),
+          projectCount: projects,
+          chargersByProvince: Object.entries(byProv)
+            .map(([province, chargers]) => ({ province, chargers: Math.round(chargers) }))
+            .sort((a, b) => b.chargers - a.chargers),
+          projectsByStatus: byStatus,
+          url: "https://open.canada.ca/data/en/dataset/706a6d1a-df8e-40e3-8e0c-94211025c528",
+        };
+      }
+      lastErr = `sheet '${sheetName}': found header-like row ${hr + 1} but no data rows under it`;
     }
   }
   throw new Error("Downloaded XLSX but no usable columns. " + lastErr);
