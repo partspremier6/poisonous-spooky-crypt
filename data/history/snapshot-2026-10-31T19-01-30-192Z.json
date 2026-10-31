@@ -1,0 +1,255 @@
+{
+  "fetchedAt": "2026-10-31T19:01:30.192Z",
+  "sources": {
+    "transportCanada": {
+      "name": "Transport Canada - EV Dashboard",
+      "lastRefreshed": "2026-10-31T19:01:30.192Z",
+      "ok": true,
+      "error": null
+    },
+    "afdc": {
+      "name": "US DOE AFDC - Public EV charging (Canada)",
+      "lastRefreshed": "2026-10-31T19:01:30.192Z",
+      "ok": false,
+      "error": "AFDC failed both endpoints — ev-charging-units: curl failed (Command failed: curl -sS --retry 2 --retry-delay 5 --connect-timeout 30 --max-time 180 -A CanadaEVDashboard/1.0 (GitHub Actions; personal use) -o /tmp/afdc-units.csv -w %{http_code) || all-stations: curl failed (Command failed: curl -sS --retry 2 --retry-delay 5 --connect-timeout 30 --max-time 180 -A CanadaEVDashboard/1.0 (GitHub Actions; personal use) -o /tmp/afdc-units.csv -w %{http_code)"
+    }
+  },
+  "kpis": {
+    "totalEvs": 1077457,
+    "bevs": 758853,
+    "phevs": 318604,
+    "totalChargers": 2017,
+    "evPerCharger": 534,
+    "marketSharePct": 11.7,
+    "marketShareQuarter": "2026 ( YTD )"
+  },
+  "data": {
+    "transportCanada": {
+      "updated": "August 2026",
+      "kpis": {
+        "totalEvs": 1077457,
+        "bevs": 758853,
+        "phevs": 318604,
+        "totalChargers": 2017,
+        "level2": 30741,
+        "level3": 8479,
+        "evPerCharger": 534
+      },
+      "marketShare": [
+        {
+          "period": "2019",
+          "bev": 2,
+          "phev": 1.1,
+          "fcev": 0,
+          "total": 3.1
+        },
+        {
+          "period": "2020",
+          "bev": 2.7,
+          "phev": 1.1,
+          "fcev": 0,
+          "total": 3.8
+        },
+        {
+          "period": "2021",
+          "bev": 3.8,
+          "phev": 1.8,
+          "fcev": 0,
+          "total": 5.6
+        },
+        {
+          "period": "2022",
+          "bev": 7,
+          "phev": 1.9,
+          "fcev": 0,
+          "total": 8.9
+        },
+        {
+          "period": "2023",
+          "bev": 8.8,
+          "phev": 2.8,
+          "fcev": 0,
+          "total": 11.6
+        },
+        {
+          "period": "2024",
+          "bev": 11.4,
+          "phev": 3.9,
+          "fcev": 0,
+          "total": 15.4
+        },
+        {
+          "period": "2025",
+          "bev": 6.7,
+          "phev": 3.6,
+          "fcev": 0,
+          "total": 10.3
+        },
+        {
+          "period": "2026 ( YTD )",
+          "bev": 8,
+          "phev": 3.6,
+          "fcev": 0,
+          "total": 11.7
+        }
+      ],
+      "fleet": [
+        {
+          "category": "Light-duty BEVs",
+          "count": 758853,
+          "sharePct": 2.8
+        },
+        {
+          "category": "Light-duty PHEVs",
+          "count": 318604,
+          "sharePct": 1.2
+        },
+        {
+          "category": "Light-duty FCEVs",
+          "count": 346,
+          "sharePct": 0
+        },
+        {
+          "category": "All light-duty vehicles",
+          "count": 26968378,
+          "sharePct": 100
+        },
+        {
+          "category": "Medium and heavy-duty BEVs",
+          "count": 11464,
+          "sharePct": 0.4
+        },
+        {
+          "category": "Medium and heavy-duty FCEVs",
+          "count": 11,
+          "sharePct": 0
+        },
+        {
+          "category": "All medium- and heavy-duty vehicles",
+          "count": 2652370,
+          "sharePct": 100
+        }
+      ],
+      "provinces": [
+        {
+          "province": "Newfoundland and Labrador",
+          "evPerCharger": null,
+          "totalEvs": 16
+        },
+        {
+          "province": "Prince Edward Island",
+          "evPerCharger": null,
+          "totalEvs": 10
+        },
+        {
+          "province": "Nova Scotia",
+          "evPerCharger": null,
+          "totalEvs": 19
+        },
+        {
+          "province": "New Brunswick",
+          "evPerCharger": null,
+          "totalEvs": 18
+        },
+        {
+          "province": "Quebec",
+          "evPerCharger": null,
+          "totalEvs": 36
+        },
+        {
+          "province": "Ontario",
+          "evPerCharger": null,
+          "totalEvs": 21
+        },
+        {
+          "province": "Manitoba",
+          "evPerCharger": null,
+          "totalEvs": 21
+        },
+        {
+          "province": "Saskatchewan",
+          "evPerCharger": null,
+          "totalEvs": 15
+        },
+        {
+          "province": "Alberta",
+          "evPerCharger": null,
+          "totalEvs": 20
+        },
+        {
+          "province": "British Columbia",
+          "evPerCharger": null,
+          "totalEvs": 30
+        },
+        {
+          "province": "Yukon",
+          "evPerCharger": null,
+          "totalEvs": 10
+        },
+        {
+          "province": "Northwest Territories",
+          "evPerCharger": null,
+          "totalEvs": 6
+        },
+        {
+          "province": "Nunavut",
+          "evPerCharger": null,
+          "totalEvs": 0
+        }
+      ],
+      "chargerGrowth": [
+        {
+          "period": "2017",
+          "level2": 2054,
+          "level3": 455
+        },
+        {
+          "period": "2018",
+          "level2": 6359,
+          "level3": 835
+        },
+        {
+          "period": "2019",
+          "level2": 9502,
+          "level3": 1579
+        },
+        {
+          "period": "2020",
+          "level2": 9972,
+          "level3": 2202
+        },
+        {
+          "period": "2021",
+          "level2": 12169,
+          "level3": 3048
+        },
+        {
+          "period": "2022",
+          "level2": 15412,
+          "level3": 3656
+        },
+        {
+          "period": "2023",
+          "level2": 21095,
+          "level3": 4718
+        },
+        {
+          "period": "2024",
+          "level2": 26205,
+          "level3": 6093
+        },
+        {
+          "period": "2025",
+          "level2": 30289,
+          "level3": 8075
+        },
+        {
+          "period": "March 2026",
+          "level2": 30741,
+          "level3": 8479
+        }
+      ],
+      "url": "https://tc.canada.ca/en/road-transportation/innovative-technologies/electric-vehicles/canada-electric-vehicle-dashboard"
+    }
+  }
+}
