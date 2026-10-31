@@ -1,21 +1,16 @@
 // ============================================================================
-// scripts/fetch-data.js — v11
+// scripts/fetch-data.js — v11.1
 //
-// Sources (final):
+// THE FIX: AFDC host corrected to developer.nlr.gov (the domain in the
+// working browser URL — v11 wrongly used developer.nrel.gov, causing
+// connection-level failures from both Node fetch and curl).
+//
+// Sources:
 //   • Transport Canada (HTML tables) — all EV/charger KPIs, provinces, trends
 //   • US DOE AFDC ev-charging-units.csv — per-port charging data incl. kW
 //       ↳ falls back to All Stations v1.csv if the units endpoint fails
 //       ↳ also calls /last-updated for a data-freshness stamp
-//
-// Dropped in v11:
-//   • Open Gov XLSX — the published file no longer contains per-province
-//     charger counts (now an "Investment Map" of program funding only)
-//
-// v11 fixes:
-//   • curl timeout arithmetic: --retry 2 --max-time 180 → worst case ~6 min
-//     fits inside the 7-min execFileSync timeout (v10 could overrun and
-//     get killed mid-transfer)
-//   • HTTP 429 (rate limit) detection with one 60s-backoff retry
+//   • Open Gov XLSX — dropped (dataset no longer contains usable data)
 // ============================================================================
 
 "use strict";
@@ -32,7 +27,7 @@ const HISTORY_DIR = path.join(DATA_DIR, "history");
 const TC_URL =
   "https://tc.canada.ca/en/road-transportation/innovative-technologies/" +
   "electric-vehicles/canada-electric-vehicle-dashboard";
-const AFDC_HOST = "https://developer.nrel.gov";
+const AFDC_HOST = "https://developer.nlr.gov";
 const AFDC_API_KEY =
   process.env.AFDC_API_KEY || "ZCWrO9fKZWtFzxsMrqfGlCcBnCx1ibQSqvJfhA1y";
 
@@ -63,9 +58,8 @@ async function httpGet(url, { asBuffer = false, timeoutMs = 120000, retries = 2 
   throw lastErr;
 }
 
-// Download to file via fetch, then curl. curl worst case must fit inside
-// the execFileSync timeout: 2 retries × 180s = 540s < 420000ms... no —
-// execFileSync timeout is set to 600000ms (10 min) so there's real slack.
+// Download to file via fetch, then curl. curl worst case (2 retries x 180s)
+// sits inside the 600s parent timeout. Self-describing errors on failure.
 async function downloadToFile(url, tmpFile, { timeoutMs = 180000 } = {}) {
   // 1) Node fetch
   try {
@@ -82,13 +76,13 @@ async function downloadToFile(url, tmpFile, { timeoutMs = 180000 } = {}) {
   } catch (fetchErr) {
     console.log("  fetch failed (" + fetchErr.message + ") — trying curl");
   }
-  // 2) curl fallback. Worst case: (2 retries + 1) × 180s = 540s; parent
-  // timeout 600s leaves slack. Also surface curl's exit status cleanly.
+  // 2) curl fallback
   try {
     const codeOut = execFileSync(
       "curl",
       ["-sS", "--retry", "2", "--retry-delay", "5", "--connect-timeout", "30",
-       "--max-time", "180", "-A", UA, "-o", tmpFile, "-w", "%{http_code}", url],
+       "--max-time", "180", "--http1.1", "--retry-all-errors", "-4",
+       "-A", UA, "-o", tmpFile, "-w", "%{http_code}", url],
       { encoding: "utf8", timeout: 600000, stdio: ["ignore", "pipe", "pipe"] }
     ).trim();
     const code = parseInt(codeOut, 10);
@@ -104,7 +98,10 @@ async function downloadToFile(url, tmpFile, { timeoutMs = 180000 } = {}) {
     return { method: "curl" };
   } catch (curlErr) {
     if (curlErr.rateLimited) throw curlErr;
-    throw new Error("curl failed (" + String(curlErr.message || "").substring(0, 180) + ")");
+    const status = curlErr.status || curlErr.code || "unknown";
+    const stderr = String(curlErr.stderr || curlErr.message || "").trim()
+      .split("\n").slice(-3).join(" | ").substring(0, 300);
+    throw new Error(`curl failed (exit ${status}): ${stderr}`);
   }
 }
 
@@ -289,9 +286,9 @@ function aggregateAfdcCsv(raw, flavor) {
   if (iL2 < 0 && iDC < 0) throw new Error("No charger-level columns. Headers: " + head.slice(0, 12).join(" | "));
 
   const byProv = {}, byNetwork = {};
-  let locations = 0, l2Units = 0, dcUnits = 0, totalKw = 0, kwPorts = 0;
-  let stationIdSeen = null;
-  const seenIds = new Set(); // for per-port files, dedupe station IDs
+  let l2Units = 0, dcUnits = 0, totalKw = 0, kwPorts = 0;
+  const seenStationIds = new Set();
+  let locations = 0;
 
   for (let r = 1; r < lines.length; r++) {
     const line = lines[r];
@@ -304,13 +301,12 @@ function aggregateAfdcCsv(raw, flavor) {
     const nd = iDC >= 0 ? (parseFloat(f[iDC]) || 0) : 0;
     const kw = iKw >= 0 ? (parseFloat(f[iKw]) || 0) : 0;
 
+    // Location counting: per-port files have repeated station IDs — dedupe.
     if (flavor === "units") {
-      // Per-port rows: one row ≈ one port. Dedupe by station ID for location counts.
       const iId = lower.indexOf("id");
-      const id = iId >= 0 ? f[iId] : null;
+      const id = iId >= 0 && f[iId] ? f[iId] : null;
       if (id != null) {
-        if (!stationIdSeen) stationIdSeen = new Set();
-        if (!stationIdSeen.has(id)) { stationIdSeen.add(id); locations++; }
+        if (!seenStationIds.has(id)) { seenStationIds.add(id); locations++; }
       } else locations++;
     } else {
       locations++;
@@ -318,11 +314,8 @@ function aggregateAfdcCsv(raw, flavor) {
 
     l2Units += n2; dcUnits += nd;
     if (kw > 0) { totalKw += kw; kwPorts++; }
-    const p = (byProv[prov] = byProv[prov] || { locations: 0, level2: 0, dcFast: 0, kw: 0 });
+    const p = (byProv[prov] = byProv[prov] || { level2: 0, dcFast: 0, kw: 0 });
     p.level2 += n2; p.dcFast += nd; p.kw += kw;
-    if (flavor === "units") p.locations = Math.max(p.locations || 0, 0); // per-port: don't inflate
-    else p.locations++;
-    if (flavor === "units") p.locations++; // count rows as proxy; approximated below
     if (iNet >= 0) {
       const net = (f[iNet] || "Non-networked").trim() || "Non-networked";
       byNetwork[net] = (byNetwork[net] || 0) + 1;
@@ -369,11 +362,14 @@ async function fetchAfdc() {
   const tmpFile = path.join(os.tmpdir(), "afdc-units.csv");
   const errs = [];
 
-  // Primary: ev-charging-units.csv (per-port, includes kW power output)
+  // Primary: ev-charging-units.csv (per-port, includes kW power output).
+  // Parameter set matches the browser-proven URL, minus non-EV fuel filters.
   try {
     const unitsUrl = () =>
       AFDC_HOST + "/api/alt-fuel-stations/v1/ev-charging-units.csv?access=public&api_key=" + enc(AFDC_API_KEY) +
-      "&country=CA&fuel_type=ELEC&status=E&limit=all&utf8_bom=true";
+      "&cards_accepted=all&country=CA&download=true&ev_charging_level=2%2Cdc_fast" +
+      "&ev_connector_type=all&ev_network=all&facility_type=all&fuel_type=ELEC" +
+      "&funding_sources=all&limit=all&owner_type=all&state=all&status=E&utf8_bom=true";
     const r = await fetchAfdcWithRetries(unitsUrl, tmpFile, "units");
     console.log("  (ev-charging-units via " + r.downloadedVia + ")");
     r.lastUpdated = await fetchAfdcLastUpdated();
@@ -387,7 +383,8 @@ async function fetchAfdc() {
   try {
     const allUrl = () =>
       AFDC_HOST + "/api/alt-fuel-stations/v1.csv?access=public&api_key=" + enc(AFDC_API_KEY) +
-      "&country=CA&fuel_type=ELEC&status=E&limit=all&utf8_bom=true";
+      "&country=CA&download=true&ev_charging_level=2%2Cdc_fast&fuel_type=ELEC" +
+      "&limit=all&status=E&utf8_bom=true";
     const r = await fetchAfdcWithRetries(allUrl, tmpFile, "stations");
     console.log("  (all-stations via " + r.downloadedVia + ")");
     r.lastUpdated = await fetchAfdcLastUpdated();
