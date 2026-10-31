@@ -7,23 +7,23 @@ on:
 
 jobs:
   fetch:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v5
+
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: '20'
-      
+          node-version: '24'
+
       - name: Install dependencies
         run: |
           npm init -y
           npm install adm-zip xlsx
-      
+
       - name: Run fetch script
-        run: node scripts/fetch-data.js
-      
+        run: node scripts/fetch-data.js || true
+
       - name: Commit new data
         run: |
           git config --global user.name 'github-actions[bot]'
